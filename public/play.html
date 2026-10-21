@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>Квиз Амины · Игра</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="wrap" style="max-width: 560px;">
+
+    <!-- Вход -->
+    <section id="s-join" class="screen">
+      <div class="center">
+        <div class="logo">Квиз <span>Амины</span></div>
+        <p class="sub">Введи имя, чтобы войти в игру</p>
+      </div>
+      <div class="card">
+        <form id="joinForm">
+          <div class="field">
+            <label for="pin">PIN игры</label>
+            <input id="pin" class="pin-input" inputmode="numeric" maxlength="6" placeholder="000000" required>
+          </div>
+          <div class="field">
+            <label for="name">Твоё имя</label>
+            <input id="name" maxlength="16" placeholder="Например, Данияр" autocomplete="off" required>
+          </div>
+          <button class="btn primary" type="submit" id="joinBtn">Войти в игру</button>
+          <div id="joinError" class="error hidden"></div>
+        </form>
+      </div>
+    </section>
+
+    <!-- Ожидание -->
+    <section id="s-wait" class="screen hidden center">
+      <div class="logo" style="margin-top: 60px;">Ты в игре!</div>
+      <div class="card" style="margin-top: 12px;">
+        <h2 id="waitName"></h2>
+        <p class="muted" id="waitText">Смотри на экран ведущего. Игра скоро начнётся.</p>
+      </div>
+    </section>
+
+    <!-- Вопрос -->
+    <section id="s-question" class="screen hidden">
+      <div class="qhead">
+        <div id="qCounter">Вопрос 1 из 10</div>
+        <div class="timer" id="timer">20</div>
+      </div>
+      <div class="bar"><i id="timerBar"></i></div>
+      <div class="question" id="qText"></div>
+      <div class="answers player" id="answers"></div>
+      <div id="answeredNote" class="card center hidden" style="margin-top: 14px;">
+        <h2>Ответ принят</h2>
+        <p class="muted">Ждём остальных…</p>
+      </div>
+    </section>
+
+    <!-- Результат вопроса -->
+    <section id="s-reveal" class="screen hidden">
+      <div class="result" id="result">
+        <div id="resultTitle" style="font-size: 22px; font-weight: 800;"></div>
+        <div class="big" id="resultIcon"></div>
+        <div class="gain" id="resultGain"></div>
+        <div class="meta" id="resultMeta"></div>
+      </div>
+      <p class="center" style="opacity: 0.8; margin-top: 16px;" id="revealHint">Следующий вопрос запустит ведущий</p>
+    </section>
+
+    <!-- Финал -->
+    <section id="s-end" class="screen hidden center">
+      <div class="logo" style="margin-top: 20px;" id="endTitle">Игра окончена</div>
+      <div class="card">
+        <div id="endPlace" style="font-size: 44px; font-weight: 900;"></div>
+        <div class="muted" id="endScore"></div>
+      </div>
+      <h3 style="margin: 24px 0 10px;">Топ 3</h3>
+      <ol class="board" id="endBoard"></ol>
+      <a class="btn ghost" href="/" style="margin-top: 16px;">На главную</a>
+    </section>
+
+    <!-- Игра закрыта -->
+    <section id="s-closed" class="screen hidden center">
+      <div class="logo" style="margin-top: 60px;">Игра завершена</div>
+      <div class="card"><p id="closedReason" class="muted"></p></div>
+      <a class="btn ghost" href="/" style="margin-top: 16px;">На главную</a>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const SHAPES = ['▲', '◆', '●', '■'];
+    const $ = (id) => document.getElementById(id);
+    const screens = ['s-join', 's-wait', 's-question', 's-reveal', 's-end', 's-closed'];
+    function show(id) { screens.forEach((s) => $(s).classList.toggle('hidden', s !== id)); window.scrollTo(0, 0); }
+    function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.remove('hidden'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.add('hidden'), 2500); }
+
+    const params = new URLSearchParams(location.search);
+    const urlPin = (params.get('pin') || '').trim();
+    const urlName = (params.get('name') || '').trim();
+    const store = {
+      get(k) { try { return localStorage.getItem(k); } catch (_) { return null; } },
+      set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} },
+    };
+
+    $('pin').value = urlPin;
+    $('name').value = urlName || store.get('quiz.name') || '';
+
+    const socket = io();
+    let me = { pin: null, name: null, playerToken: null };
+    let timerHandle = null;
+    let answered = false;
+
+    // ---- Подключение ----
+    function join(pin, name, silent) {
+      const playerToken = store.get('quiz.token.' + pin);
+      $('joinBtn').disabled = true;
+      socket.emit('player:join', { pin, name, playerToken }, (res) => {
+        $('joinBtn').disabled = false;
+        if (!res.ok) {
+          $('joinError').textContent = res.error;
+          $('joinError').classList.remove('hidden');
+          show('s-join');
+          return;
+        }
+        me = { pin, name: res.snapshot.name, playerToken: res.playerToken };
+        store.set('quiz.name', me.name);
+        store.set('quiz.token.' + pin, res.playerToken);
+        applySnapshot(res.snapshot);
+        if (!silent) toast('Ты в игре');
+      });
+    }
+
+    $('joinForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      $('joinError').classList.add('hidden');
+      join($('pin').value.trim(), $('name').value.trim());
+    });
+
+    socket.on('connect', () => {
+      if (me.pin) join(me.pin, me.name, true); // переподключение
+      else if (urlPin && urlName) join(urlPin, urlName);
+      else if (urlPin && store.get('quiz.token.' + urlPin)) join(urlPin, store.get('quiz.name') || '', true);
+    });
+    socket.on('disconnect', () => toast('Связь потеряна, переподключаемся…'));
+
+    function applySnapshot(s) {
+      if (s.state === 'lobby') { $('waitName').textContent = s.name; show('s-wait'); }
+      else if (s.state === 'question') { renderQuestion(s.question); if (s.answered) markAnswered(); }
+      else if (s.state === 'reveal') renderReveal(s.reveal);
+      else if (s.state === 'end') renderEnd(s.end);
+    }
+
+    // ---- Вопрос ----
+    socket.on('game:question', renderQuestion);
+
+    function renderQuestion(q) {
+      answered = false;
+      $('qCounter').textContent = `Вопрос ${q.index + 1} из ${q.total}`;
+      $('qText').textContent = q.text;
+      $('answeredNote').classList.add('hidden');
+      const box = $('answers');
+      box.innerHTML = '';
+      box.classList.remove('hidden');
+      q.answers.forEach((a, i) => {
+        const b = document.createElement('button');
+        b.className = `answer c${i}`;
+        b.innerHTML = `<span class="shape">${SHAPES[i]}</span><span>${escapeHtml(a)}</span>`;
+        b.addEventListener('click', () => answer(i));
+        box.appendChild(b);
+      });
+      show('s-question');
+      startTimer(q);
+    }
+
+    function startTimer(q) {
+      clearInterval(timerHandle);
+      const limitMs = q.timeLimit * 1000;
+      const offset = Date.now() - q.serverNow; // разница часов клиента и сервера
+      const endAt = q.startedAt + offset + limitMs;
+      const tick = () => {
+        const left = Math.max(0, endAt - Date.now());
+        const sec = Math.ceil(left / 1000);
+        $('timer').textContent = sec;
+        $('timer').classList.toggle('hurry', sec <= 5 && sec > 0);
+        $('timerBar').style.width = (left / limitMs * 100) + '%';
+        if (left <= 0) { clearInterval(timerHandle); lockAnswers(); }
+      };
+      tick();
+      timerHandle = setInterval(tick, 100);
+    }
+
+    function lockAnswers() { document.querySelectorAll('#answers .answer').forEach((b) => (b.disabled = true)); }
+
+    function markAnswered() {
+      answered = true;
+      $('answers').classList.add('hidden');
+      $('answeredNote').classList.remove('hidden');
+    }
+
+    function answer(i) {
+      if (answered) return;
+      answered = true;
+      lockAnswers();
+      socket.emit('player:answer', { answerIndex: i }, (res) => {
+        if (res.ok) markAnswered();
+        else { answered = false; toast(res.error || 'Не удалось отправить'); }
+      });
+    }
+
+    // ---- Результат ----
+    socket.on('game:reveal', renderReveal);
+
+    function renderReveal(r) {
+      clearInterval(timerHandle);
+      const box = $('result');
+      box.className = 'result ' + (r.answerIndex === null ? 'none' : r.isCorrect ? 'ok' : 'bad');
+      $('resultTitle').textContent = r.answerIndex === null ? 'Время вышло' : r.isCorrect ? 'Правильно!' : 'Неверно';
+      $('resultIcon').textContent = r.answerIndex === null ? '⏱' : r.isCorrect ? '✓' : '✗';
+      $('resultGain').textContent = r.gained > 0 ? `+${r.gained}` : '+0';
+      const streak = r.streak >= 2 ? ` · серия ${r.streak} 🔥` : '';
+      $('resultMeta').textContent = `Всего: ${r.score} · место ${r.rank} из ${r.players}${streak}`;
+      $('revealHint').textContent = r.isLast ? 'Сейчас будут итоги' : 'Следующий вопрос запустит ведущий';
+      show('s-reveal');
+      if (navigator.vibrate) navigator.vibrate(r.isCorrect ? [60, 40, 60] : 200);
+    }
+
+    // ---- Финал ----
+    socket.on('game:end', renderEnd);
+
+    function renderEnd(e) {
+      const medals = ['🥇', '🥈', '🥉'];
+      $('endTitle').textContent = e.rank === 1 ? 'Ты победил(а)!' : e.rank <= 3 ? 'Ты в тройке!' : 'Игра окончена';
+      $('endPlace').textContent = e.rank ? `${medals[e.rank - 1] || ''} ${e.rank} место` : '';
+      $('endScore').textContent = `${e.score} очков · игроков: ${e.players}`;
+      $('endBoard').innerHTML = e.leaderboard.map((p) =>
+        `<li><span class="rank">${medals[p.rank - 1] || p.rank}</span><span>${escapeHtml(p.name)}</span><span class="score">${p.score}</span></li>`
+      ).join('');
+      show('s-end');
+    }
+
+    socket.on('game:closed', ({ reason }) => {
+      clearInterval(timerHandle);
+      me = { pin: null, name: null, playerToken: null };
+      $('closedReason').textContent = reason || 'Ведущий закрыл игру';
+      show('s-closed');
+    });
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+  </script>
+</body>
+</html>
