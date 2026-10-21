@@ -1,6 +1,6 @@
 # Квиз Амины
 
-Онлайн квиз в стиле Kahoot. Ведущий показывает PIN, друзья заходят с телефонов и отвечают на вопросы в реальном времени. Очки зависят от скорости ответа, после каждого вопроса показывается таблица лидеров, в конце подиум.
+Онлайн квиз в стиле Kahoot. Работает на Vercel. Ведущий показывает PIN, друзья заходят с телефонов и отвечают на вопросы в реальном времени. Очки зависят от скорости ответа, после каждого вопроса показывается таблица лидеров, в конце подиум.
 
 ## Как играть
 
@@ -14,7 +14,7 @@
 
 ## Вопросы
 
-Банк лежит в `questions.json`. Две категории: «Про Амину» и «Наука и мир».
+Банк лежит в `public/questions.json`. Две категории: «Про Амину» и «Наука и мир».
 
 Вопросы с пометкой `needsEdit` содержат шаблонные варианты ответов. Их можно отредактировать прямо на странице ведущего (кнопка ✏️) или в файле. Свои вопросы добавляются кнопкой «+ Свой вопрос» и хранятся в браузере ведущего. Есть экспорт и импорт в JSON.
 
@@ -33,25 +33,24 @@ npm start
 npm test
 ```
 
-## Деплой в интернет
+## Деплой на Vercel
 
-Нужен хостинг с поддержкой WebSocket. Подходят Railway, Render, Fly.io.
+Vercel не поддерживает WebSocket, поэтому игра работает через быстрый опрос сервера (каждые 0,7 секунды), а состояние игры хранится в Upstash Redis. Без Redis игра на Vercel не запустится: каждый вызов функции получил бы свою память.
 
-**Railway**
+1. Открой ссылку [Deploy to Vercel](https://vercel.com/new/clone?repository-url=https://github.com/kletochkinaamina-coder/checklist_bot) или на vercel.com нажми Add New → Project → Import репозитория `checklist_bot`. Framework Preset: Other. Нажми Deploy.
+2. В проекте открой вкладку Storage → Create Database → Upstash for Redis → Free план → Create → Connect to project. Vercel сам добавит переменные `KV_REST_API_URL` и `KV_REST_API_TOKEN`.
+3. Deployments → три точки у последнего деплоя → Redeploy.
+4. Открой `https://<проект>.vercel.app/host`. Готово.
 
-1. New Project → Deploy from GitHub repo → выбрать этот репозиторий.
-2. Railway сам определит Node.js и запустит `npm start`.
-3. Settings → Networking → Generate Domain. Готово.
+Проверка: `https://<проект>.vercel.app/health` должен вернуть `"store":"upstash"`. Если там `memory`, переменные Redis не подхватились, нужен Redeploy.
 
-**Render**
+Бесплатных лимитов Upstash (500 тысяч команд в месяц) хватает примерно на 10 игр по 15 вопросов с 10 игроками.
 
-1. New → Web Service → подключить репозиторий.
-2. Build command: `npm install`. Start command: `npm start`.
-3. Instance type: Free. После деплоя открыть `https://<имя>.onrender.com/host`.
+## Другие хостинги
 
-Бесплатный тариф Render засыпает после 15 минут без трафика, первый вход может занять до минуты. Открой сайт за пару минут до игры.
+Подойдёт любой хостинг с Node.js: Railway, Render, Fly.io. Там Redis не обязателен, игра хранится в памяти процесса. Команда запуска: `npm start`.
 
-**Docker**
+Docker:
 
 ```bash
 docker build -t amina-quiz .
@@ -62,8 +61,10 @@ docker run -p 3000:3000 amina-quiz
 
 | Файл | Назначение |
 |---|---|
-| `server.js` | Express + Socket.IO, вся игровая логика |
-| `questions.json` | Банк вопросов |
+| `server.js` | Express, HTTP API и вся игровая логика |
+| `lib/store.js` | Хранилище: память локально, Upstash Redis на Vercel |
+| `api/index.js`, `vercel.json` | Точка входа и маршруты для Vercel |
+| `public/questions.json` | Банк вопросов |
 | `public/host.html` | Экран ведущего и редактор вопросов |
 | `public/play.html` | Экран игрока |
 | `public/index.html` | Вход по PIN |

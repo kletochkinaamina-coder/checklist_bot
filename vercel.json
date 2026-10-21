@@ -1,0 +1,9 @@
+{
+  "rewrites": [
+    { "source": "/host", "destination": "/host.html" },
+    { "source": "/play", "destination": "/play.html" },
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/qr/(.*)", "destination": "/api/index" },
+    { "source": "/health", "destination": "/api/index" }
+  ]
+}

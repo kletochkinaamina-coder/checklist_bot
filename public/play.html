@@ -88,13 +88,20 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script src="/socket.io/socket.io.js"></script>
   <script>
     const SHAPES = ['▲', '◆', '●', '■'];
     const $ = (id) => document.getElementById(id);
     const screens = ['s-join', 's-wait', 's-question', 's-reveal', 's-end', 's-closed'];
     function show(id) { screens.forEach((s) => $(s).classList.toggle('hidden', s !== id)); window.scrollTo(0, 0); }
     function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.remove('hidden'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.add('hidden'), 2500); }
+    function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+    async function api(method, url, body) {
+      try {
+        const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, cache: 'no-store' });
+        const d = await r.json().catch(() => ({ ok: false, error: 'Ошибка сервера' }));
+        return { status: r.status, ...d };
+      } catch (_) { return { ok: false, status: 0, error: 'Нет связи с сервером' }; }
+    }
 
     const params = new URLSearchParams(location.search);
     const urlPin = (params.get('pin') || '').trim();
@@ -102,34 +109,40 @@
     const store = {
       get(k) { try { return localStorage.getItem(k); } catch (_) { return null; } },
       set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} },
+      del(k) { try { localStorage.removeItem(k); } catch (_) {} },
     };
 
     $('pin').value = urlPin;
     $('name').value = urlName || store.get('quiz.name') || '';
 
-    const socket = io();
-    let me = { pin: null, name: null, playerToken: null };
+    let me = null; // { pin, playerId, playerToken, name }
     let timerHandle = null;
+    let pollHandle = null;
+    let polling = false;
     let answered = false;
+    let renderedKey = null;
+    let offlineSince = 0;
 
     // ---- Подключение ----
-    function join(pin, name, silent) {
-      const playerToken = store.get('quiz.token.' + pin);
+    async function join(pin, name) {
+      const saved = store.get('quiz.session.' + pin);
+      let session = null;
+      try { session = saved ? JSON.parse(saved) : null; } catch (_) {}
       $('joinBtn').disabled = true;
-      socket.emit('player:join', { pin, name, playerToken }, (res) => {
-        $('joinBtn').disabled = false;
-        if (!res.ok) {
-          $('joinError').textContent = res.error;
-          $('joinError').classList.remove('hidden');
-          show('s-join');
-          return;
-        }
-        me = { pin, name: res.snapshot.name, playerToken: res.playerToken };
-        store.set('quiz.name', me.name);
-        store.set('quiz.token.' + pin, res.playerToken);
-        applySnapshot(res.snapshot);
-        if (!silent) toast('Ты в игре');
-      });
+      const res = await api('POST', `/api/player/${encodeURIComponent(pin)}/join`, { name, playerToken: session && session.playerToken });
+      $('joinBtn').disabled = false;
+      if (!res.ok) {
+        $('joinError').textContent = res.error;
+        $('joinError').classList.remove('hidden');
+        show('s-join');
+        return;
+      }
+      me = { pin, playerId: res.playerId, playerToken: res.playerToken, name: res.snapshot.name };
+      store.set('quiz.name', me.name);
+      store.set('quiz.session.' + pin, JSON.stringify({ playerId: me.playerId, playerToken: me.playerToken }));
+      renderedKey = null;
+      applySnapshot(res.snapshot);
+      startPolling();
     }
 
     $('joinForm').addEventListener('submit', (e) => {
@@ -138,24 +151,45 @@
       join($('pin').value.trim(), $('name').value.trim());
     });
 
-    socket.on('connect', () => {
-      if (me.pin) join(me.pin, me.name, true); // переподключение
-      else if (urlPin && urlName) join(urlPin, urlName);
-      else if (urlPin && store.get('quiz.token.' + urlPin)) join(urlPin, store.get('quiz.name') || '', true);
-    });
-    socket.on('disconnect', () => toast('Связь потеряна, переподключаемся…'));
+    if (urlPin && (urlName || store.get('quiz.session.' + urlPin))) join(urlPin, urlName || store.get('quiz.name') || '');
+
+    function startPolling() {
+      clearTimeout(pollHandle);
+      const loop = async () => {
+        if (!me) return;
+        if (!polling) {
+          polling = true;
+          const res = await api('GET', `/api/player/${me.pin}?playerId=${me.playerId}&token=${me.playerToken}`);
+          polling = false;
+          if (!me) return;
+          if (res.status === 404 || res.status === 403) { closed(res.error); return; }
+          if (res.ok) { offlineSince = 0; applySnapshot(res.snapshot); }
+          else if (res.status === 0) {
+            if (!offlineSince) offlineSince = Date.now();
+            if (Date.now() - offlineSince > 3000) toast('Нет связи, пробуем снова…');
+          }
+        }
+        pollHandle = setTimeout(loop, 700);
+      };
+      loop();
+    }
 
     function applySnapshot(s) {
-      if (s.state === 'lobby') { $('waitName').textContent = s.name; show('s-wait'); }
-      else if (s.state === 'question') { renderQuestion(s.question); if (s.answered) markAnswered(); }
-      else if (s.state === 'reveal') renderReveal(s.reveal);
-      else if (s.state === 'end') renderEnd(s.end);
+      const idx = s.question?.index ?? s.reveal?.index ?? '';
+      const key = `${s.state}:${idx}`;
+      const fresh = key !== renderedKey;
+      renderedKey = key;
+      if (s.state === 'lobby') { if (fresh) { $('waitName').textContent = s.name; show('s-wait'); } }
+      else if (s.state === 'question') {
+        if (fresh) renderQuestion(s.question, s.serverNow);
+        if (s.answered && !answered) markAnswered();
+      }
+      else if (s.state === 'reveal') { if (fresh) renderReveal(s.reveal); }
+      else if (s.state === 'end') { if (fresh) renderEnd(s.end); }
     }
 
     // ---- Вопрос ----
-    socket.on('game:question', renderQuestion);
-
-    function renderQuestion(q) {
+    function renderQuestion(q, serverNow) {
       answered = false;
       $('qCounter').textContent = `Вопрос ${q.index + 1} из ${q.total}`;
       $('qText').textContent = q.text;
@@ -171,13 +205,13 @@
         box.appendChild(b);
       });
       show('s-question');
-      startTimer(q);
+      startTimer(q, serverNow);
     }
 
-    function startTimer(q) {
+    function startTimer(q, serverNow) {
       clearInterval(timerHandle);
       const limitMs = q.timeLimit * 1000;
-      const offset = Date.now() - q.serverNow; // разница часов клиента и сервера
+      const offset = Date.now() - serverNow; // разница часов клиента и сервера
       const endAt = q.startedAt + offset + limitMs;
       const tick = () => {
         const left = Math.max(0, endAt - Date.now());
@@ -199,19 +233,16 @@
       $('answeredNote').classList.remove('hidden');
     }
 
-    function answer(i) {
+    async function answer(i) {
       if (answered) return;
       answered = true;
       lockAnswers();
-      socket.emit('player:answer', { answerIndex: i }, (res) => {
-        if (res.ok) markAnswered();
-        else { answered = false; toast(res.error || 'Не удалось отправить'); }
-      });
+      const res = await api('POST', `/api/player/${me.pin}/answer`, { playerId: me.playerId, token: me.playerToken, answerIndex: i });
+      if (res.ok) markAnswered();
+      else { answered = false; document.querySelectorAll('#answers .answer').forEach((b) => (b.disabled = false)); toast(res.error || 'Не удалось отправить'); }
     }
 
     // ---- Результат ----
-    socket.on('game:reveal', renderReveal);
-
     function renderReveal(r) {
       clearInterval(timerHandle);
       const box = $('result');
@@ -227,8 +258,6 @@
     }
 
     // ---- Финал ----
-    socket.on('game:end', renderEnd);
-
     function renderEnd(e) {
       const medals = ['🥇', '🥈', '🥉'];
       $('endTitle').textContent = e.rank === 1 ? 'Ты победил(а)!' : e.rank <= 3 ? 'Ты в тройке!' : 'Игра окончена';
@@ -240,15 +269,12 @@
       show('s-end');
     }
 
-    socket.on('game:closed', ({ reason }) => {
-      clearInterval(timerHandle);
-      me = { pin: null, name: null, playerToken: null };
+    function closed(reason) {
+      clearInterval(timerHandle); clearTimeout(pollHandle);
+      if (me) store.del('quiz.session.' + me.pin);
+      me = null;
       $('closedReason').textContent = reason || 'Ведущий закрыл игру';
       show('s-closed');
-    });
-
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
   </script>
 </body>
