@@ -18,7 +18,8 @@
       <span class="logo">AL MUSK</span>
       <span class="sub">учёт смены</span>
     </div>
-    <div class="datebar">
+    <div class="role" id="roleBox"></div>
+    <div class="datebar" id="dateBar">
       <button class="icon-btn" data-act="prevDay" aria-label="Предыдущий день">‹</button>
       <input type="date" id="dateInput" aria-label="Дата смены">
       <button class="icon-btn" data-act="nextDay" aria-label="Следующий день">›</button>
@@ -27,10 +28,11 @@
   </header>
   <div id="banner"></div>
   <main id="view"><div class="loading">Загрузка…</div></main>
-  <nav class="tabs" id="tabs">
+  <nav class="tabs" id="tabs" hidden>
+    <button data-tab="cabinet">Кабинет<span class="dot" id="discDot" hidden></span></button>
     <button data-tab="shift">Смена</button>
     <button data-tab="reports">Отчёты</button>
-    <button data-tab="disc">Расхождения<span class="dot" id="discDot" hidden></span></button>
+    <button data-tab="disc">Контроль</button>
     <button data-tab="ref">Справочник</button>
   </nav>
   <div id="modal" class="modal" hidden></div>
@@ -39,6 +41,7 @@
     <form id="loginForm" class="login-card">
       <div class="logo big">AL MUSK</div>
       <p>Введите PIN для входа</p>
+      <p class="small muted">PIN руководителя открывает кабинет, PIN продавцов открывает смену магазина.</p>
       <input id="pinInput" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN" required>
       <p class="err" id="loginErr"></p>
       <button class="btn primary big">Войти</button>

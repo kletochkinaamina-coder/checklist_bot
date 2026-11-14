@@ -38,13 +38,15 @@
 
   const S = {
     pin: LS.get('am_pin') || '',
+    role: 'owner',
+    sellerPinSet: false,
     health: null,
     settings: C.withDefaults(null),
     srev: 0,
     date: today(),
     day: null,
     index: {},
-    tab: LS.get('am_tab') || 'shift',
+    tab: LS.get('am_tab') || 'cabinet',
     rep: { mode: 'day', date: null, from: null, to: null, preset: 'month' },
     refSearch: '',
   };
@@ -91,15 +93,37 @@
     const d = await api('GET', `/api/day/${S.date}`);
     S.day = d.value;
   }
+  const isOwner = () => S.role === 'owner';
+
   async function loadAll() {
-    await Promise.all([loadSettings(), loadIndex(), loadDay()]);
+    if (!isOwner()) {
+      S.date = (S.health && S.health.today) || today();
+      S.tab = 'shift';
+      S.index = {};
+      await Promise.all([loadSettings(), loadDay()]);
+    } else {
+      await Promise.all([loadSettings(), loadIndex(), loadDay()]);
+    }
     render();
+  }
+
+  /** Свежие данные с сервера: продавец и руководитель работают с разных телефонов. */
+  let refreshing = false;
+  async function refresh() {
+    if (refreshing || !$('#login').hidden) return;
+    refreshing = true;
+    try {
+      if (isOwner()) await Promise.all([loadIndex(), loadDay()]);
+      else await loadDay();
+    } finally {
+      refreshing = false;
+    }
   }
 
   async function act(action, date = S.date) {
     const d = await api('POST', `/api/day/${date}`, action);
     if (date === S.date) S.day = d.value;
-    S.index[date] = C.daySummary(d.value);
+    if (isOwner()) S.index[date] = C.daySummary(d.value);
     return d.value;
   }
 
@@ -177,7 +201,7 @@
     const h = S.health;
     let html = '';
     if (h && h.store === 'memory') html += '<div class="b bad">Данные НЕ сохраняются: не подключена база Upstash Redis. Подключите её в Vercel (Storage) и сделайте Redeploy. Инструкция в README.</div>';
-    if (h && !h.auth && h.store === 'upstash') html += '<div class="b warn">PIN не задан: приложение доступно любому, у кого есть ссылка. Добавьте переменную ACCESS_PIN в Vercel.</div>';
+    if (h && !h.auth && h.store === 'upstash') html += '<div class="b warn">PIN руководителя не задан: приложение доступно любому, у кого есть ссылка. Добавьте переменную OWNER_PIN в Vercel.</div>';
     $('#banner').innerHTML = html;
   }
 
@@ -195,12 +219,26 @@
   /* ---------- Рендер ---------- */
 
   function render() {
+    const owner = isOwner();
+    document.body.classList.toggle('seller', !owner);
+    $('#tabs').hidden = !owner;
+    $('#dateBar').hidden = !owner;
+    $('#roleBox').innerHTML = owner
+      ? (S.health && S.health.auth ? '<span class="badge">Руководитель</span>' : '')
+      : '<span class="badge">Продавец</span><button class="chip" data-act="logout">Выйти</button>';
     $('#dateInput').value = S.date;
     $('#todayBtn').hidden = S.date === today();
     $$('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === S.tab));
-    $('#discDot').hidden = !(unresolvedDisc().length || openPastDays().length);
+    $('#discDot').hidden = !owner || !attention().some((a) => a.lvl === 'bad');
     const v = $('#view');
-    if (S.tab === 'shift') v.innerHTML = S.day ? viewDay() : viewOpen();
+    if (!owner) {
+      v.innerHTML = S.day ? sellerDay() : sellerOpen();
+      return;
+    }
+    if (S.tab === 'cabinet') {
+      v.innerHTML = viewCabinet();
+      loadCabinet();
+    } else if (S.tab === 'shift') v.innerHTML = S.day ? viewDay() : viewOpen();
     else if (S.tab === 'reports') {
       v.innerHTML = viewReports();
       loadReport();
@@ -306,19 +344,24 @@
 
   function saleHtml(sale, open) {
     const c = C.saleCalc(sale);
+    const owner = isOwner();
+    const costTxt = (it, ic) => (!owner ? '' : it.costPending ? '<span class="badge bad">нет себестоимости</span> · ' : `себест. ${M(ic.cost)}`);
     const items = c.items.map(({ it, c: ic }) => `<li><span>${esc(C.itemTitle(it))}${it.gift ? ' <span class="badge gold">подарок</span>' : ''}
-        <div class="m">себест. ${M(ic.cost)}${it.type !== 'other' ? ` · масло ${C.fmt(ic.oilMl)} мл${it.type === 'perfume' ? ` · основа ${C.fmt(ic.baseMl)} мл` : ''}` : ''}${ic.discount ? ` · скидка ${M(ic.discount)} с ${M(ic.fullPrice)}` : ''}</div></span>
+        <div class="m">${costTxt(it, ic)}${it.type !== 'other' ? ` · масло ${C.fmt(ic.oilMl)} мл${it.type === 'perfume' ? ` · основа ${C.fmt(ic.baseMl)} мл` : ''}` : ''}${ic.discount ? ` · скидка ${M(ic.discount)} с ${M(ic.fullPrice)}` : ''}</div></span>
         <span class="num">${it.gift ? '0 ₸' : M(ic.price)}</span></li>`).join('');
     const promo = sale.promo
-      ? `<div class="note info small">Акция «${esc(sale.promo)}»: выручка ${M(c.revenue)}, себестоимость товаров ${M(c.cost - c.giftCost)}, подарков ${M(c.giftCost)}, всего ${M(c.cost)}, прибыль ${M(c.profit)}</div>`
+      ? owner
+        ? `<div class="note info small">Акция «${esc(sale.promo)}»: выручка ${M(c.revenue)}, себестоимость товаров ${M(c.cost - c.giftCost)}, подарков ${M(c.giftCost)}, всего ${M(c.cost)}, прибыль ${M(c.profit)}</div>`
+        : `<div class="small"><span class="badge gold">Акция «${esc(sale.promo)}»</span></div>`
       : '';
     return `<div class="li">
       <div class="row between"><b>${esc(sale.time || '')} · ${sale.seller ? esc(sale.seller) : `<span class="badge warn">${C.NO_SELLER}</span>`}</b><b class="num">${M(c.revenue)}</b></div>
       <ul class="sale-items">${items}</ul>
       ${promo}
-      <div class="row between wrap small"><span>${payBadges(c)}</span><span class="muted">себест. ${M(c.cost)} · прибыль <b>${M(c.profit)}</b></span></div>
+      <div class="row between wrap small"><span>${payBadges(c)}</span>${owner ? `<span class="muted">себест. ${M(c.cost)} · прибыль <b>${M(c.profit)}</b>${c.pendingCost ? ' (неполная)' : ''}</span>` : ''}</div>
       ${!c.payOk ? `<div class="note bad small">Оплата ${M(c.paySum)} не равна сумме ${M(c.revenue)}</div>` : ''}
       ${sale.note ? `<div class="small muted">${esc(sale.note)}</div>` : ''}
+      ${owner && sale.by === 'seller' ? '<div class="small muted">внёс продавец</div>' : ''}
       ${open ? `<div class="row" style="margin-top:8px"><button class="btn sm" data-act="editSale" data-id="${sale.id}">Изменить</button><button class="btn sm danger" data-act="delSale" data-id="${sale.id}">Удалить</button></div>` : ''}
     </div>`;
   }
@@ -368,8 +411,9 @@
     const sales = [...(d.sales || [])].reverse();
     const ops = [...(d.ops || [])].reverse();
     return `
+      ${ownerDayAlerts(d, t)}
       <section class="card">
-        <div class="row between"><h2>Смена ${C.dmy(d.date)}</h2>${open ? '<span class="badge ok">открыта</span>' : `<span class="badge">закрыта${d.closing && d.closing.closedWithGaps ? ' с пропусками' : ''}</span>`}</div>
+        <div class="row between"><h2>Смена ${C.dmy(d.date)}</h2>${open ? `<span class="badge ok">${d.closing && d.closing.submittedAt ? 'сдана продавцом' : 'открыта'}</span>` : `<span class="badge">закрыта${d.closing && d.closing.closedWithGaps ? ' с пропусками' : ''}</span>`}</div>
         <p class="small muted">Начало ${esc(op.time || '')}. Начальные остатки: наличные ${M(op.cash)}, Kaspi Pay ${M(op.kaspi)}, переводы ${op.transferTracked === false ? 'не учитываются' : M(op.transfer)}${op.note ? `. ${esc(op.note)}` : ''}</p>
         ${open ? '<button class="btn ghost sm" data-act="editOpening">Изменить начальные остатки</button>' : ''}
         <h3 style="margin-top:14px">Продавцы</h3>
@@ -391,7 +435,54 @@
       <section class="card"><h3>Расходы и операции (${ops.length})</h3><div class="list">${ops.length ? ops.map((o) => opHtml(o, open)).join('') : '<p class="empty">Операций нет.</p>'}</div>
         ${t.purchases ? `<p class="hint">Закупки товара ${M(t.purchases)} уменьшают деньги, но не входят в себестоимость продаж.</p>` : ''}</section>
       <section class="card"><h3>Остатки денег</h3>${balancesTable(t)}</section>
-      ${open ? closeCta(t) : closedBlock(d)}`;
+      ${open ? closeCta(t) : closedBlock(d)}
+      <section class="card"><div class="row between"><h3>Журнал изменений</h3><button class="btn sm" data-act="showLog">Показать</button></div><p class="small muted">${(d.log || []).length} записей: кто и что менял, удалённые продажи с причинами.</p></section>`;
+  }
+
+  function ownerDayAlerts(d, t) {
+    const out = [];
+    const cl = d.closing || {};
+    if (cl.submittedAt && d.status !== 'closed') {
+      out.push(`<div class="note info"><b>Смена сдана продавцом${cl.submittedTime ? ` в ${esc(cl.submittedTime)}` : ''}.</b> Проверьте суммы, внесите комиссию и остатки Kaspi, затем закройте смену.${(cl.submitGaps || []).length ? `<br>Сдана без: ${cl.submitGaps.map(esc).join(', ')}` : ''}${cl.sellerNote ? `<br>Комментарий продавца: ${esc(cl.sellerNote)}` : ''}
+        <div class="row wrap" style="margin-top:8px"><button class="btn sm gold" data-act="openClosing">Проверить и закрыть</button><button class="btn sm" data-act="unsubmit">Вернуть продавцу</button></div></div>`);
+    }
+    if (!t.control.openingConfirmed) {
+      out.push(`<div class="note warn">Смену открыл продавец. Начальные остатки Kaspi Pay (${M(d.opening.kaspi)}) и переводов (${M(d.opening.transfer)}) подставлены с прошлой смены и не подтверждены. <button class="link" data-act="editOpening">Подтвердить</button></div>`);
+    }
+    if (t.pendingCost) {
+      out.push(`<div class="note bad">Позиций без себестоимости: ${t.pendingCost}. Прибыль завышена. Добавьте аромат в справочник и нажмите <button class="link" data-act="fillPending">«Заполнить из справочника»</button> или внесите цену в продаже.</div>`);
+    }
+    if (t.sellerDeletions.count) {
+      out.push(`<div class="note warn">Продавец удалил продаж: ${t.sellerDeletions.count} на ${M(t.sellerDeletions.sum)}. Причины в журнале изменений. <button class="link" data-act="showLog">Открыть журнал</button></div>`);
+    }
+    return out.join('');
+  }
+
+  const LOG_LABEL = {
+    open: 'Смена открыта', setOpening: 'Изменены начальные остатки', setSellers: 'Изменены продавцы', addSeller: 'Добавлен продавец',
+    addSale: 'Продажа добавлена', editSale: 'Продажа изменена', removeSale: 'Продажа удалена', addOp: 'Операция добавлена',
+    editOp: 'Операция изменена', removeOp: 'Операция удалена', setClosing: 'Данные закрытия', addPhoto: 'Фото сверки', removePhoto: 'Фото удалено',
+    submit: 'Смена сдана продавцом', unsubmit: 'Смена возвращена продавцу', fillPending: 'Себестоимость заполнена из справочника',
+    close: 'Смена закрыта', reopen: 'Смена открыта для исправления', setDiscNote: 'Отметка по расхождению',
+  };
+
+  function showLog() {
+    const log = [...(S.day.log || [])].reverse();
+    const fmtT = (iso) => {
+      const d = new Date(iso);
+      return `${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+    const detail = (l) => {
+      const d = l.d || {};
+      if (d.removed && d.removed.items) return ` · ${M(C.saleCalc(d.removed).revenue)}: ${esc(d.removed.items.map((i) => i.name).join(', '))}${d.reason ? ` · причина: ${esc(d.reason)}` : ''}`;
+      if (d.removed) return ` · ${esc(d.removed.category)} ${M(d.removed.amount)}${d.reason ? ` · причина: ${esc(d.reason)}` : ''}`;
+      if (d.reason) return ` · ${esc(d.reason)}`;
+      if (d.gaps) return ` · без: ${esc(d.gaps.join(', '))}`;
+      if (d.filled) return ` · позиций: ${d.filled}`;
+      if (d.name) return ` · ${esc(d.name)}`;
+      return '';
+    };
+    modal('Журнал изменений', log.length ? `<div class="list">${log.map((l) => `<div class="li small"><b>${fmtT(l.t)}</b> · ${l.by === 'seller' ? '<span class="badge warn">продавец</span>' : '<span class="badge">руководитель</span>'} ${esc(LOG_LABEL[l.a] || l.a)}${detail(l)}</div>`).join('')}</div>` : '<p class="empty">Записей нет.</p>', true);
   }
 
   function closeCta(t) {
@@ -424,7 +515,8 @@
   };
 
   function newItem(type) {
-    return { id: uid(), type, name: '', volume: '', conc: '', concManual: false, oilPrice: '', bottleCost: '', basePrice: S.settings.basePrice, unitCost: '', qty: 1, gift: false, fullPrice: '', price: '', src: 'manual', saveRef: true };
+    // У продавца себестоимость считает сервер, поэтому в форме она не требуется
+    return { id: uid(), type, name: '', volume: '', conc: '', concManual: false, oilPrice: '', bottleCost: '', basePrice: S.settings.basePrice, unitCost: '', qty: 1, gift: false, fullPrice: '', price: '', src: 'manual', saveRef: true, costPending: isOwner() ? undefined : true };
   }
 
   function applyVolumeDefaults(it) {
@@ -478,6 +570,11 @@
     const miss = C.itemMissing(it);
     const c = C.itemCalc(it);
     if (miss.length) return `<span class="hint bad">Не заполнено: ${esc(miss.join(', '))}</span>`;
+    if (!isOwner()) {
+      const ml = it.type === 'perfume' ? `масло ${C.fmt(c.oilMl)} мл · основа ${C.fmt(c.baseMl)} мл · ` : it.type === 'oil' ? `масло ${C.fmt(c.oilMl)} мл · ` : '';
+      return `${ml}${it.gift ? 'подарок' : `цена <b>${M(c.price)}</b>${c.discount ? ` · скидка ${M(c.discount)}` : ''}`}${it.type !== 'other' && C.blank(it.name) ? '' : C.findOil(S.settings, it.name) || C.findGood(S.settings, it.name) ? '' : '<br><span class="hint">Нет в справочнике: себестоимость внесёт руководитель</span>'}`;
+    }
+    if (it.costPending && C.costMissing(it).length) return '<span class="hint bad">Себестоимость не определена: укажите закупочную цену</span>';
     let parts;
     if (it.type === 'perfume') {
       parts = `масло ${C.fmt(c.oilMl)} мл × ${M(it.oilPrice)} = ${M(c.oilMl * C.num(it.oilPrice))} · основа ${C.fmt(c.baseMl)} мл × ${M(it.basePrice)} = ${M(c.baseMl * C.num(it.basePrice))} · флакон ${M(it.bottleCost)}`;
@@ -516,7 +613,7 @@
         <label>${it.type === 'other' ? 'Товар (фиксатор, пустой флакон…)' : 'Аромат'}<input data-f="name" list="${it.type === 'other' ? 'goodsList' : 'oilList'}" value="${esc(it.name)}" autocomplete="off"></label>
         ${mid}
       </div>
-      <div class="grid3">${perfumeFields}${bottle}<div class="dyn">${dynHtml(it)}</div></div>
+      <div class="grid3">${perfumeFields}${isOwner() ? `${bottle}<div class="dyn">${dynHtml(it)}</div>` : ''}</div>
       <label class="check"><input type="checkbox" data-f="gift" ${it.gift ? 'checked' : ''}> Подарок по акции (выручки нет, себестоимость учитывается)</label>
       ${it.gift ? '' : `<div class="grid2">
         <label>Цена до скидки, ₸<input data-f="fullPrice" inputmode="decimal" value="${esc(fmtNum(it.fullPrice))}" placeholder="если была скидка"></label>
@@ -543,8 +640,9 @@
         };
     if (existing) {
       for (const it of draft.items) {
-        it.src = 'snap';
-        it.saveRef = false;
+        it.src = isOwner() && it.costPending ? 'manual' : 'snap';
+        it.saveRef = isOwner() && !!it.costPending;
+        if (!isOwner()) it.costPending = true;
         it.concManual = true;
         for (const k of ['fullPrice', 'price', 'conc', 'oilPrice', 'bottleCost', 'unitCost', 'volume']) if (it[k] === undefined) it[k] = '';
         if (it.basePrice === undefined || it.basePrice === '') it.basePrice = S.settings.basePrice;
@@ -600,8 +698,10 @@
       $('#payInfo', form).innerHTML = c.payOk
         ? (c.revenue > 0 ? `<div class="note ok small">Оплата распределена: ${c.method}</div>` : '')
         : `<div class="note ${left > 0 ? 'warn' : 'bad'} small">${left > 0 ? `Осталось распределить ${M(left)}` : `Оплата больше суммы на ${M(-left)}`}</div>`;
-      $('#saleTotals', form).innerHTML = `<div class="totals">${kpi('Выручка', M(c.revenue))}${kpi('Себестоимость', M(c.cost))}${kpi('Прибыль', M(c.profit), 'hl')}</div>
-        ${c.gifts ? `<p class="hint">В т.ч. подарки: ${c.gifts} шт., себестоимость ${M(c.giftCost)}</p>` : ''}`;
+      $('#saleTotals', form).innerHTML = isOwner()
+        ? `<div class="totals">${kpi('Выручка', M(c.revenue))}${kpi('Себестоимость', M(c.cost))}${kpi('Прибыль', M(c.profit), 'hl')}</div>
+        ${c.gifts ? `<p class="hint">В т.ч. подарки: ${c.gifts} шт., себестоимость ${M(c.giftCost)}</p>` : ''}`
+        : `<div class="totals">${kpi('Сумма продажи', M(c.revenue), 'hl')}${kpi('Позиций', c.positions)}${kpi('Подарков', c.gifts)}</div>`;
     };
     renderItems();
 
@@ -719,8 +819,9 @@
       const btn = $('button.primary', form);
       btn.disabled = true;
       try {
-        const newOils = draft.items.filter((it) => it.type !== 'other' && it.src === 'manual' && it.saveRef && !C.findOil(S.settings, it.name));
-        const newGoods = draft.items.filter((it) => it.type === 'other' && it.src === 'manual' && it.saveRef && !C.findGood(S.settings, it.name));
+        const canRef = isOwner();
+        const newOils = draft.items.filter((it) => canRef && it.type !== 'other' && it.src === 'manual' && it.saveRef && !C.costMissing(it).length && !C.findOil(S.settings, it.name));
+        const newGoods = draft.items.filter((it) => canRef && it.type === 'other' && it.src === 'manual' && it.saveRef && !C.costMissing(it).length && !C.findGood(S.settings, it.name));
         if (newOils.length || newGoods.length) {
           const d = today();
           await saveSettings((st) => {
@@ -751,6 +852,8 @@
 
   /* ----- Операции ----- */
 
+  const SELLER_KINDS = ['business', 'purchase', 'refund'];
+
   function openOp(existing) {
     const d = existing
       ? clone(existing)
@@ -767,7 +870,7 @@
     const draw = () => {
       const k = C.OP_KINDS[d.kind];
       return `<form id="opForm" autocomplete="off">
-        <div class="seg wrap">${Object.entries(C.OP_KINDS).map(([key, v]) => `<button type="button" data-kind="${key}" class="${key === d.kind ? 'on' : ''}">${v.label}</button>`).join('')}</div>
+        <div class="seg wrap">${Object.entries(C.OP_KINDS).filter(([key]) => isOwner() || SELLER_KINDS.includes(key)).map(([key, v]) => `<button type="button" data-kind="${key}" class="${key === d.kind ? 'on' : ''}">${v.label}</button>`).join('')}</div>
         <p class="hint">${HINT[d.kind]}</p>
         <div class="grid2">
           <label>Категория<select name="category">${k.cats.map((c) => `<option ${c === d.category ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
@@ -809,6 +912,7 @@
       d.kind = b.dataset.kind;
       d.category = C.OP_KINDS[d.kind].cats[0];
       if (d.kind === 'personal' || d.kind === 'transfer') d.account = 'kaspi';
+      if (!isOwner()) d.account = 'cash';
       presetTransfer();
       body.innerHTML = draw();
     });
@@ -1267,7 +1371,8 @@
     all.sort((a, b) => (a.resolved === b.resolved ? (a.date < b.date ? 1 : -1) : a.resolved ? 1 : -1));
     const pastOpen = openPastDays();
     const gaps = Object.values(S.index).filter((s) => s.closedWithGaps).sort((a, b) => (a.date < b.date ? 1 : -1));
-    return `<section class="card"><h2>Расхождения</h2>
+    return `<section class="card"><h2>Требует внимания</h2>${attentionHtml(attention())}</section>
+      <section class="card"><h2>Расхождения</h2>
         <p class="small muted">Разница между фактом и расчётом. Цифры не исправляются автоматически: выясните причину и отметьте результат.</p>
         <div class="list">${all.length ? all.map((d) => `<div class="li"><div class="row between"><b>${C.dmy(d.date)} · ${esc(d.label)}</b><b class="num ${d.diff < 0 ? 'neg' : ''}">${C.signed(d.diff)}</b></div>
           <div class="small muted">расчёт ${M(d.calc)} · факт ${M(d.fact)}</div>
@@ -1328,6 +1433,13 @@
           <div><div class="row between"><h3>Флаконы масла</h3><button class="btn sm" data-act="tbl" data-t="oilBottles">Изменить</button></div><table><tbody>${tableRows(st.oilBottles)}</tbody></table></div>
         </div>
         ${(st.changeLog || []).length ? `<h3>Журнал изменений</h3><ul class="small muted">${st.changeLog.slice(-10).reverse().map((c) => `<li>${C.dmy(c.date)}: ${esc(c.text)}</li>`).join('')}</ul>` : ''}
+      </section>
+      <section class="card"><h2>Доступ продавцов</h2>
+        ${S.health && S.health.auth
+          ? `<p class="small">PIN продавцов: ${S.sellerPinSet ? '<span class="badge ok">задан</span>' : '<span class="badge warn">не задан, продавцы не могут войти</span>'}</p>
+            <p class="small muted">Продавец видит только свою смену: продажи и выручку. Себестоимость, прибыль, остатки Kaspi, зарплаты, личные операции и отчёты ему недоступны.</p>
+            <div class="row wrap"><input id="sellerPinIn" inputmode="numeric" placeholder="новый PIN, 4–12 цифр" style="max-width:220px"><button class="btn sm primary" data-act="saveSellerPin">Сохранить</button>${S.sellerPinSet ? '<button class="btn sm danger" data-act="clearSellerPin">Отключить вход продавцов</button>' : ''}</div>`
+          : '<div class="note warn small">Сначала задайте PIN руководителя: переменная OWNER_PIN в Vercel. Без него вход один для всех.</div>'}
       </section>
       <section class="card"><h2>Данные</h2>
         <div class="row wrap"><button class="btn sm" data-act="export">Скачать резервную копию (JSON)</button>${S.health && S.health.auth ? '<button class="btn sm danger" data-act="logout">Выйти</button>' : ''}</div>
@@ -1558,6 +1670,244 @@
     }
   }
 
+  /* ---------- Кабинет руководителя ---------- */
+
+  function attention() {
+    const out = [];
+    const t = today();
+    const recent = addDays(t, -14);
+    const list = Object.values(S.index).sort((a, b) => (a.date < b.date ? 1 : -1));
+    for (const s of list) {
+      const d = C.dmy(s.date);
+      const add = (lvl, text, extra) => out.push({ lvl, text, date: s.date, ...(extra || {}) });
+      if (s.status !== 'closed' && s.submittedAt) add('bad', `Смена ${d} сдана продавцом и ждёт закрытия`);
+      else if (s.status !== 'closed' && s.date < t) add('bad', `Смена ${d} не закрыта`);
+      if (s.openingUnconfirmed) add('warn', `${d}: начальные остатки Kaspi и переводов не подтверждены`);
+      if (s.pendingCost) add('bad', `${d}: позиций без себестоимости ${s.pendingCost}, прибыль завышена`);
+      for (const x of s.disc || []) if (!x.resolved) add('bad', `${d}: ${x.label} ${C.signed(x.diff)}`, { disc: x.key });
+      if (s.date >= recent && s.sellerDeletions && s.sellerDeletions.count) add('warn', `${d}: продавец удалил продаж ${s.sellerDeletions.count} на ${M(s.sellerDeletions.sum)}`);
+      if (s.date >= recent && s.status === 'closed' && s.salaryUnpaid) add('warn', `${d}: зарплата начислена, не выплачена ${M(s.salaryUnpaid)}`);
+      if (s.unclearOps) add('warn', `${d}: операций с неуточнённым назначением ${s.unclearOps}`);
+      if (s.status === 'closed' && s.commissionMissing) add('warn', `${d}: не указана комиссия Kaspi`);
+      if (s.closedWithGaps) add('warn', `${d}: смена закрыта с незаполненными полями`);
+      if (s.unknownSellerSales) add('warn', `${d}: продаж без продавца ${s.unknownSellerSales}`);
+      if (s.payMismatch) add('bad', `${d}: чеков, где оплата не равна сумме ${s.payMismatch}`);
+    }
+    return out.sort((a, b) => (a.lvl === b.lvl ? 0 : a.lvl === 'bad' ? -1 : 1));
+  }
+
+  function attentionHtml(att, limit) {
+    if (!att.length) return '<div class="note ok">Всё в порядке: открытых вопросов нет.</div>';
+    const rows = att.slice(0, limit || att.length).map((a) => `<div class="attn"><div class="t"><span class="lvl ${a.lvl}"></span>${esc(a.text)}</div>
+      ${a.disc ? `<button class="btn sm" data-act="discNote" data-date="${a.date}" data-key="${a.disc}">Разобрать</button>` : `<button class="btn sm" data-act="goDate" data-date="${a.date}">Открыть</button>`}</div>`).join('');
+    return rows + (limit && att.length > limit ? `<p class="small"><button class="link" data-act="tabDisc">Все вопросы (${att.length})</button></p>` : '');
+  }
+
+  function viewCabinet() {
+    const t = today();
+    const s = S.index[t];
+    const att = attention();
+    const pendingDays = Object.values(S.index).filter((x) => x.pendingCost).length;
+    const status = !s ? '<span class="badge warn">не открыта</span>' : s.status === 'closed' ? '<span class="badge">закрыта</span>' : s.submittedAt ? '<span class="badge gold">сдана, ждёт проверки</span>' : '<span class="badge ok">идёт</span>';
+    return `<section class="card">
+        <div class="row between wrap"><h2>Кабинет руководителя</h2><span class="small muted">${C.dmy(t)}</span></div>
+        <div class="row between wrap" style="margin:8px 0"><span>Смена сегодня ${status}</span>${s && s.sellers.length ? `<span class="small muted">${s.sellers.map(esc).join(', ')}</span>` : ''}</div>
+        ${s ? `<div class="kpis">${kpi('Выручка сегодня', M(s.revenue), 'hl')}${kpi('Чеков', s.receipts)}${kpi('Валовая прибыль', M(s.gross))}${kpi('Результат дня', M(s.result))}</div>` : ''}
+        <button class="btn sm primary" data-act="goDate" data-date="${t}">${s ? 'Открыть смену дня' : 'Открыть смену'}</button>
+      </section>
+      <section class="card"><h3>Требует внимания</h3>${attentionHtml(att, 8)}
+        ${pendingDays ? `<div style="margin-top:10px"><button class="btn sm gold" data-act="fillAllPending">Заполнить себестоимость из справочника (${pendingDays} дн.)</button></div>` : ''}
+      </section>
+      <div id="cabOut"><div class="loading">Считаю месяц…</div></div>`;
+  }
+
+  async function loadCabinet() {
+    const [from, to] = presetRange('month');
+    try {
+      const days = await api('GET', `/api/range?from=${from}&to=${to}`);
+      const out = $('#cabOut');
+      if (!out) return;
+      if (!days.length) {
+        out.innerHTML = '<section class="card"><p class="empty">В этом месяце смен ещё нет.</p></section>';
+        return;
+      }
+      const R = C.rangeTotals(days);
+      const row = (l, v, b) => `<tr class="${b ? 'total' : ''}"><td>${esc(l)}</td><td class="n">${M(v)}</td></tr>`;
+      out.innerHTML = `<h3 style="margin:4px 0 10px">Месяц: ${C.dmy(from)} – ${C.dmy(to)}</h3>
+        <div class="kpis">${kpi('Выручка', M(R.revenue), 'hl')}${kpi('Валовая прибыль', M(R.gross))}${kpi('Чистый результат', M(R.result), 'hl')}${kpi('Средний чек', M(R.avgCheck))}
+          ${kpi('Kaspi Pay', M(R.pay.kaspi))}${kpi('Переводы', M(R.pay.transfer))}${kpi('Наличные', M(R.pay.cash))}${kpi('Чеков / подарков', `${R.receipts} / ${R.gifts}`)}</div>
+        <section class="card"><h3>Финансовый результат</h3><table><tbody>
+          ${row('Выручка', R.revenue)}${row('Себестоимость (с подарками)', -R.cogs)}${row('Валовая прибыль', R.gross, true)}
+          ${row('Зарплаты', -R.salaries)}${row('Комиссии Kaspi', -R.commission)}${row('Аренда и прочие расходы', -R.business)}${R.refunds ? row('Возвраты', -R.refunds) : ''}
+          ${row('Чистый операционный результат', R.result, true)}</tbody></table>
+          ${R.pendingCost ? `<div class="note bad small">Позиций без себестоимости: ${R.pendingCost}. Результат завышен.</div>` : ''}
+          ${R.commissionMissingDays ? `<div class="note warn small">Комиссия Kaspi не указана за ${R.commissionMissingDays} дн.</div>` : ''}
+        </section>
+        <section class="card"><h3>Деньги (это не прибыль)</h3><table><tbody>
+          ${row('Закупки товара', R.purchases)}${row('Личные снятия и расходы владельца', R.personal)}${R.salaryUnpaid ? row('Зарплата к выплате', R.salaryUnpaid) : ''}</tbody></table>
+          ${R.lastBalances ? `<h3 style="margin-top:14px">Остатки на ${C.dmy(R.lastDate)}</h3>${balancesTable({ balances: R.lastBalances })}` : ''}
+        </section>
+        <section class="card"><h3>Продавцы за месяц</h3>${sellersTable(R.sellerRank, true)}</section>
+        <section class="card"><h3>Топ ароматов</h3>${R.topAromas.length ? `<table><tbody>${R.topAromas.slice(0, 5).map((a, i) => `<tr><td>${i + 1}. ${esc(a.name)}</td><td class="n">${a.sold} шт.</td><td class="n">${M(a.revenue)}</td></tr>`).join('')}</tbody></table>` : '<p class="empty">Нет продаж.</p>'}
+          <div style="margin-top:12px"><button class="btn sm" data-act="cabReport">Подробный отчёт за месяц</button></div></section>`;
+    } catch (err) {
+      const out = $('#cabOut');
+      if (out) out.innerHTML = `<section class="card"><div class="note bad">${esc(err.message)}</div></section>`;
+    }
+  }
+
+  async function fillAllPending() {
+    const dates = Object.values(S.index).filter((x) => x.pendingCost).map((x) => x.date);
+    let left = 0;
+    for (const d of dates) {
+      const v = await act({ type: 'fillPending' }, d);
+      left += C.dayTotals(v).pendingCost;
+    }
+    if (dates.includes(S.date)) await loadDay();
+    render();
+    toast(left ? `Осталось без себестоимости: ${left}. Добавьте эти ароматы в справочник.` : 'Себестоимость заполнена', !!left);
+  }
+
+  /* ---------- Экран продавца ---------- */
+
+  function sellerOpen() {
+    const dir = S.settings.sellers || [];
+    if (!dir.length) {
+      return `<section class="card"><h2>Смена ${C.dmy(S.date)}</h2><div class="note warn">Руководитель ещё не добавил продавцов. Попросите добавить вас в справочник.</div></section>`;
+    }
+    return `<section class="card"><h2>Открытие смены · ${C.dmy(S.date)}</h2>
+      <form id="sellerOpenForm" autocomplete="off">
+        <h3>Кто работает</h3>
+        ${dir.map((x, i) => `<label class="check"><input type="checkbox" name="who" value="${esc(x.name)}" ${dir.length === 1 || x.name === LS.get('am_last_seller') ? 'checked' : ''}> ${esc(x.name)}</label>`).join('')}
+        <div class="grid2">
+          <label>Время начала<input name="time" type="time" value="${nowTime()}"></label>
+          <label>Наличные в кассе, ₸<input name="cash" inputmode="decimal" placeholder="пересчитайте"></label>
+        </div>
+        <label>Комментарий<input name="note" placeholder="необязательно"></label>
+        <div id="openErr"></div>
+        <button class="btn primary big">Открыть смену</button>
+      </form></section>`;
+  }
+
+  async function submitSellerOpen(form) {
+    const fd = new FormData(form);
+    const who = fd.getAll('who');
+    const errs = [];
+    if (!who.length) errs.push('Отметьте, кто работает');
+    if (C.blank(fd.get('cash'))) errs.push('Укажите наличные в кассе по пересчёту');
+    if (errs.length) {
+      $('#openErr').innerHTML = `<div class="note bad">${errs.map(esc).join('<br>')}</div>`;
+      return;
+    }
+    await act({ type: 'open', opening: { time: fd.get('time'), cash: fd.get('cash'), note: fd.get('note') }, sellers: who.map((name) => ({ name, start: fd.get('time') })) });
+    if (who.length === 1) LS.set('am_last_seller', who[0]);
+    toast('Смена открыта');
+    render();
+  }
+
+  function sellerDay() {
+    const d = S.day;
+    const t = C.dayTotals(d);
+    const cl = d.closing || {};
+    const done = d.status === 'closed' || !!cl.submittedAt;
+    const sales = [...(d.sales || [])].reverse();
+    const ops = [...(d.ops || [])].reverse();
+    return `${done ? `<div class="note ${d.status === 'closed' ? 'ok' : 'info'}">${d.status === 'closed' ? 'Смена закрыта руководителем.' : `Смена сдана${cl.submittedTime ? ` в ${esc(cl.submittedTime)}` : ''}. Если нужно что-то исправить, обратитесь к руководителю.`}</div>` : ''}
+      <section class="card">
+        <div class="row between"><h2>Смена ${C.dmy(d.date)}</h2>${done ? '<span class="badge">сдана</span>' : '<span class="badge ok">открыта</span>'}</div>
+        <p class="small muted">Начало ${esc(d.opening.time || '')}. Наличные на начало: ${M(d.opening.cash)}</p>
+        <p>${(d.sellers || []).map((s) => `<span class="badge">${esc(s.name)} ${esc(s.start || '')}${s.end ? `–${esc(s.end)}` : ''}</span>`).join(' ')}</p>
+        ${done ? '' : '<button class="btn ghost sm" data-act="addSellerToShift">+ Продавец в смену</button>'}
+      </section>
+      <div class="kpis">${kpi('Продажи за смену', M(t.revenue), 'hl')}${kpi('Kaspi Pay', M(t.pay.kaspi))}${kpi('Переводы', M(t.pay.transfer))}${kpi('Наличные', M(t.pay.cash))}</div>
+      ${done ? '' : '<div class="actions"><button class="btn primary big" data-act="newSale">+ Продажа</button><button class="btn big" data-act="newOp">+ Расход из кассы</button></div>'}
+      <section class="card"><h3>Продажи (${sales.length})</h3><div class="list">${sales.length ? sales.map((x) => saleHtml(x, !done)).join('') : '<p class="empty">Продаж пока нет.</p>'}</div></section>
+      <section class="card"><h3>Расходы смены (${ops.length})</h3><div class="list">${ops.length ? ops.map((o) => opHtml(o, !done)).join('') : '<p class="empty">Расходов нет.</p>'}</div></section>
+      ${done ? '' : '<section class="card"><h3>Конец смены</h3><p class="small muted">Сделайте сверку на терминале, пересчитайте наличные и сдайте смену. Руководитель проверит и закроет её.</p><button class="btn gold big" data-act="openSubmit">Сдать смену</button></section>'}`;
+  }
+
+  function openAddSeller() {
+    const inShift = new Set((S.day.sellers || []).map((s) => C.norm(s.name)));
+    const free = (S.settings.sellers || []).filter((x) => !inShift.has(C.norm(x.name)));
+    if (!free.length) return toast('Все продавцы из справочника уже в смене', true);
+    const body = modal('Продавец в смену', `<form><label>Продавец<select name="name">${free.map((x) => `<option>${esc(x.name)}</option>`).join('')}</select></label>
+      <label style="max-width:200px">Начало работы<input name="start" type="time" value="${nowTime()}"></label>
+      <div class="sheet-f"><button type="button" class="btn" data-act="closeModal">Отмена</button><button class="btn primary">Добавить</button></div></form>`);
+    body.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      try {
+        await act({ type: 'addSeller', name: fd.get('name'), start: fd.get('start') });
+        closeModal();
+        render();
+      } catch (err) {
+        fail(err);
+      }
+    });
+  }
+
+  function openSubmit() {
+    const d = S.day;
+    const cl = d.closing || {};
+    const t = C.dayTotals(d);
+    const f = (name, label, hint) => `<label>${label}<input name="${name}" inputmode="decimal" value="${esc(fmtNum(cl[name]))}"></label>${hint ? `<div class="hint">${hint}</div>` : ''}`;
+    const body = modal('Сдать смену', `<form id="submitForm" autocomplete="off">
+      <ol class="steps">
+        <li><b>Фото сверки с терминала</b>
+          <div id="photoBox">${cl.photo ? '<p class="small">Фото приложено.</p>' : '<p class="small muted">Сделайте фото чека сверки.</p>'}</div>
+          <input type="file" accept="image/*" capture="environment" id="photoIn"></li>
+        <li>${f('kaspiTerminal', 'Kaspi Pay по сверке терминала, ₸', `Внесено продаж Kaspi Pay: ${M(t.pay.kaspi)}`)}</li>
+        <li>${f('transfersReported', 'Переводы за смену, ₸', `Внесено продаж переводом: ${M(t.pay.transfer)}`)}</li>
+        <li>${f('cashSalesReported', 'Продажи наличными, ₸', `Внесено продаж наличными: ${M(t.pay.cash)}`)}</li>
+        <li>${f('cashActual', 'Наличные в кассе после пересчёта, ₸', 'Пересчитайте все деньги в кассе.')}</li>
+      </ol>
+      <div class="grid2"><label>Время окончания<input name="time" type="time" value="${nowTime()}"></label><label>Комментарий<input name="note" value="${esc(cl.sellerNote || '')}" placeholder="необязательно"></label></div>
+      <p class="hint">Если сумма терминала не совпадает с внесёнными продажами, проверьте, все ли продажи внесены.</p>
+      <div id="subErr"></div>
+      <div class="sheet-f"><button type="button" class="btn" data-act="closeModal">Отмена</button><button class="btn gold">Сдать смену</button></div>
+    </form>`, true);
+    const form = $('#submitForm', body);
+    $('#photoIn', form).addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      $('#photoBox', form).innerHTML = '<p class="small muted">Загрузка фото…</p>';
+      try {
+        const dataUrl = await compressImage(file);
+        const r = await api('PUT', `/api/photo/${S.date}`, { dataUrl });
+        S.day = r.value;
+        $('#photoBox', form).innerHTML = `<img class="photo-prev" src="${dataUrl}" alt="Сверка с терминала"><p class="small">Фото приложено.</p>`;
+      } catch (err) {
+        $('#photoBox', form).innerHTML = '<p class="small muted">Фото не загружено.</p>';
+        fail(err);
+      }
+    });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      const closing = {};
+      for (const k of ['kaspiTerminal', 'transfersReported', 'cashSalesReported', 'cashActual']) closing[k] = String(fd.get(k)).trim();
+      closing.note = fd.get('note');
+      const action = { type: 'submit', time: fd.get('time'), closing };
+      try {
+        try {
+          await act(action);
+        } catch (err) {
+          if (err.status !== 422) throw err;
+          if (!confirm(`${err.message}\n\nСдать смену без этих данных? Руководитель увидит пропуски.`)) {
+            $('#subErr', form).innerHTML = `<div class="note warn">${esc(err.message)}</div>`;
+            return;
+          }
+          await act({ ...action, withGaps: true });
+        }
+        closeModal();
+        render();
+        toast('Смена сдана');
+      } catch (err) {
+        fail(err);
+      }
+    });
+  }
+
   /* ---------- События ---------- */
 
   async function setDate(d) {
@@ -1680,6 +2030,48 @@
     tbl: (b) => openTable(b.dataset.t),
     basePrice: openBasePrice,
     export: exportData,
+    showLog,
+    fillPending: async () => {
+      const v = await act({ type: 'fillPending' });
+      render();
+      const left = C.dayTotals(v).pendingCost;
+      toast(left ? `Осталось без себестоимости: ${left}. Добавьте эти ароматы в справочник.` : 'Себестоимость заполнена', !!left);
+    },
+    fillAllPending,
+    unsubmit: async () => {
+      const reason = prompt('Вернуть смену продавцу для исправления? Укажите причину:');
+      if (reason === null) return;
+      await act({ type: 'unsubmit', reason });
+      render();
+      toast('Смена возвращена продавцу');
+    },
+    tabDisc: () => {
+      S.tab = 'disc';
+      render();
+    },
+    cabReport: () => {
+      S.tab = 'reports';
+      S.rep.mode = 'range';
+      S.rep.preset = 'month';
+      [S.rep.from, S.rep.to] = presetRange('month');
+      render();
+    },
+    addSellerToShift: openAddSeller,
+    openSubmit,
+    saveSellerPin: async () => {
+      const pin = $('#sellerPinIn').value.trim();
+      if (!/^\d{4,12}$/.test(pin)) return toast('PIN: от 4 до 12 цифр', true);
+      await api('PUT', '/api/seller-pin', { pin });
+      S.sellerPinSet = true;
+      render();
+      toast('PIN продавцов сохранён. Сообщите его продавцам.');
+    },
+    clearSellerPin: async () => {
+      if (!confirm('Отключить вход продавцов?')) return;
+      await api('PUT', '/api/seller-pin', { pin: '' });
+      S.sellerPinSet = false;
+      render();
+    },
     logout: () => {
       LS.del('am_pin');
       S.pin = '';
@@ -1694,6 +2086,7 @@
       LS.set('am_tab', S.tab);
       render();
       window.scrollTo({ top: 0 });
+      refresh().then(() => $('#modal').hidden && render()).catch(fail);
       return;
     }
     const b = e.target.closest('[data-act]');
@@ -1708,11 +2101,11 @@
     if (e.key === 'Escape' && !$('#modal').hidden) closeModal();
   });
   document.addEventListener('submit', (e) => {
-    if (e.target.id === 'openForm') {
+    if (e.target.id === 'openForm' || e.target.id === 'sellerOpenForm') {
       e.preventDefault();
       const btn = $('button.primary', e.target);
       btn.disabled = true;
-      submitOpen(e.target).catch(fail).finally(() => (btn.disabled = false));
+      (e.target.id === 'openForm' ? submitOpen : submitSellerOpen)(e.target).catch(fail).finally(() => (btn.disabled = false));
     }
   });
   document.addEventListener('change', (e) => {
@@ -1742,7 +2135,7 @@
     e.preventDefault();
     S.pin = $('#pinInput').value.trim();
     try {
-      await api('POST', '/api/login');
+      await whoAmI();
       LS.set('am_pin', S.pin);
       $('#login').hidden = true;
       $('#pinInput').value = '';
@@ -1752,16 +2145,34 @@
     }
   });
 
+  async function whoAmI() {
+    const me = await api('POST', '/api/login');
+    S.role = me.role;
+    S.sellerPinSet = !!me.sellerPinSet;
+    if (me.today) S.health.today = me.today;
+  }
+
   async function boot() {
     try {
       S.health = await api('GET', '/api/health');
       renderBanner();
       if (S.health.auth && !S.pin) return showLogin();
+      await whoAmI();
       await loadAll();
     } catch (err) {
       if (err.status === 401) return;
       $('#view').innerHTML = `<section class="card"><div class="note bad">${esc(err.message)}</div><button class="btn" onclick="location.reload()">Повторить</button></section>`;
     }
   }
+  // Обновление при возврате в приложение и раз в минуту, если не открыта форма
+  const softRefresh = () => {
+    if (document.hidden || !$('#modal').hidden || !S.settings) return;
+    const typing = document.activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName);
+    if (typing) return;
+    refresh().then(() => $('#modal').hidden && render()).catch(() => {});
+  };
+  document.addEventListener('visibilitychange', softRefresh);
+  setInterval(softRefresh, 60000);
+
   boot();
 })();

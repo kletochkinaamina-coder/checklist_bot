@@ -113,14 +113,25 @@ main { max-width: 980px; margin: 0 auto; padding: 14px 16px 24px; }
 /* Tabs */
 .tabs {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-  display: grid; grid-template-columns: repeat(4, 1fr);
+  display: grid; grid-template-columns: repeat(5, 1fr);
   background: var(--card); border-top: 1px solid var(--line);
   padding-bottom: env(safe-area-inset-bottom);
 }
+.tabs[hidden] { display: none; }
 .tabs button {
-  position: relative; border: 0; background: none; color: var(--muted); font: inherit; font-size: 13px;
-  padding: 14px 4px; cursor: pointer;
+  position: relative; border: 0; background: none; color: var(--muted); font: inherit; font-size: 12px;
+  padding: 14px 2px; cursor: pointer; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+body.seller { padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
+.role { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.role .badge { background: rgba(255, 255, 255, 0.15); color: #e9cf96; }
+.attn { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+.attn:first-child { border-top: 0; padding-top: 0; }
+.attn .t { font-size: 14px; }
+.attn .t small { display: block; color: var(--muted); font-size: 12px; }
+.lvl { width: 8px; height: 8px; border-radius: 50%; flex: none; margin-right: 8px; display: inline-block; }
+.lvl.bad { background: var(--bad); }
+.lvl.warn { background: var(--gold); }
 .tabs button.on { color: var(--accent); font-weight: 700; box-shadow: inset 0 3px 0 var(--gold); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme='light']) .tabs button.on { color: var(--gold); } }
 .dot { position: absolute; top: 9px; margin-left: 3px; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
@@ -253,3 +264,5 @@ td.neg { color: var(--bad); }
 .steps > li::marker { font-weight: 700; color: var(--gold); }
 .empty { color: var(--muted); padding: 8px 0; }
 .search { margin-bottom: 10px; }
+
+.datebar[hidden], .role:empty { display: none; }

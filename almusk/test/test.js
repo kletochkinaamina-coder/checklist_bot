@@ -161,13 +161,13 @@ function startServer(store, env = {}) {
 
 async function apiTests() {
   console.log('API');
-  const srv = await startServer(new MemoryStore(), { ACCESS_PIN: '4321' });
+  const srv = await startServer(new MemoryStore(), { OWNER_PIN: '4321' });
   const base = `http://127.0.0.1:${srv.address().port}`;
   const call = async (method, path, body, pin = '4321') => {
     const r = await fetch(base + path, { method, headers: { 'content-type': 'application/json', 'x-pin': pin }, body: body ? JSON.stringify(body) : undefined });
     return { status: r.status, body: await r.json() };
   };
-  const D = '2026-11-14';
+  const D = '2020-10-14'; // прошлая дата: продавцу недоступна
   try {
     await test('без PIN доступа нет', async () => {
       assert.equal((await call('GET', '/api/settings', null, '')).status, 401);
@@ -257,7 +257,7 @@ async function apiTests() {
       assert.equal(cash.resolved, true);
     });
     await test('отчёт за период', async () => {
-      const r = await call('GET', '/api/range?from=2026-11-01&to=2026-11-30');
+      const r = await call('GET', '/api/range?from=2020-10-01&to=2020-10-31');
       assert.equal(r.body.length, 1);
       const R = C.rangeTotals(r.body);
       assert.equal(R.revenue, 10000);
@@ -269,9 +269,111 @@ async function apiTests() {
       assert.equal(r.body.days.length, 1);
       assert.equal(r.body.settings.oils[0].name, 'Black Opium');
     });
+
+    /* ---------- Продавец ---------- */
+    const T = (await call('GET', '/api/health')).body.today;
+    const S = '1111';
+    await test('руководитель задаёт PIN продавцов, роли определяются по PIN', async () => {
+      assert.equal((await call('PUT', '/api/seller-pin', { pin: '4321' })).status, 400);
+      assert.equal((await call('PUT', '/api/seller-pin', { pin: S })).status, 200);
+      assert.equal((await call('POST', '/api/login', {}, S)).body.role, 'seller');
+      assert.equal((await call('POST', '/api/login', {})).body.role, 'owner');
+      assert.equal((await call('PUT', '/api/seller-pin', { pin: '2222' }, S)).status, 403);
+    });
+    await test('продавцу закрыты отчёты, справочник с ценами, экспорт, чужие даты', async () => {
+      for (const path of ['/api/index', '/api/export', `/api/range?from=${T}&to=${T}`, `/api/day/${D}`]) {
+        assert.equal((await call('GET', path, null, S)).status, 403, path);
+      }
+      const st = (await call('GET', '/api/settings', null, S)).body.value;
+      assert.equal(st.oils[0].price, undefined);
+      assert.equal(st.basePrice, null);
+      assert.equal(JSON.stringify(st).includes('50'), true); // объёмы флаконов видны, цены нет
+      assert.equal(Object.values(st.perfumeBottles).every((v) => v === null), true);
+      assert.equal((await call('PUT', '/api/settings', { rev: 0, value: st }, S)).status, 403);
+    });
+    await test('продавец открывает смену: зарплата из справочника, остатки Kaspi не подтверждены', async () => {
+      const cur = (await call('GET', '/api/settings')).body;
+      await call('PUT', '/api/settings', { rev: cur.rev, value: { ...cur.value, sellers: [{ name: 'Дана', salary: 5000 }] } });
+      let r = await call('POST', `/api/day/${T}`, { type: 'open', opening: { cash: 12000 }, sellers: [{ name: 'Неизвестная' }] }, S);
+      assert.equal(r.status, 400);
+      r = await call('POST', `/api/day/${T}`, { type: 'open', opening: { time: '10:00', cash: 12000, kaspi: 999999 }, sellers: [{ name: 'дана', start: '10:00' }] }, S);
+      assert.equal(r.status, 200);
+      assert.equal(r.body.value.sellers[0].salary, undefined);
+      assert.equal(r.body.value.opening.kaspi, undefined);
+      const own = (await call('GET', `/api/day/${T}`)).body.value;
+      assert.equal(own.sellers[0].salary, 5000);
+      assert.equal(own.opening.confirmed, false);
+      assert.notEqual(own.opening.kaspi, 999999);
+    });
+    await test('продажа продавца: себестоимость считает сервер, продавец её не видит', async () => {
+      const r = await call('POST', `/api/day/${T}`, { type: 'upsertSale', sale: { id: 'p1', seller: 'Дана', items: [{ id: 'i1', type: 'perfume', name: 'black opium', volume: 30, price: 10000, oilPrice: 1 }], pay: { cash: 10000 } } }, S);
+      assert.equal(r.status, 200);
+      assert.equal(r.body.value.sales[0].items[0].oilPrice, undefined);
+      const it = (await call('GET', `/api/day/${T}`)).body.value.sales[0].items[0];
+      assert.equal(it.oilPrice, 50);
+      assert.equal(it.conc, 40);
+      assert.equal(it.bottleCost, 300);
+      assert.equal(C.itemCalc(it).cost, 945);
+    });
+    await test('аромата нет в справочнике: продажа сохраняется, себестоимость ждёт руководителя', async () => {
+      let r = await call('POST', `/api/day/${T}`, { type: 'upsertSale', sale: { id: 'p2', seller: 'Дана', items: [{ id: 'i2', type: 'oil', name: 'Новинка', volume: 6, price: 4000 }], pay: { kaspi: 4000 } } }, S);
+      assert.equal(r.status, 200);
+      let idx = (await call('GET', '/api/index')).body;
+      assert.equal(idx[T].pendingCost, 1);
+      const cur = (await call('GET', '/api/settings')).body;
+      await call('PUT', '/api/settings', { rev: cur.rev, value: { ...cur.value, oils: cur.value.oils.concat({ name: 'Новинка', price: 30 }) } });
+      r = await call('POST', `/api/day/${T}`, { type: 'fillPending' });
+      const it = r.body.value.sales[1].items[0];
+      assert.equal(it.costPending, undefined);
+      assert.equal(C.itemCalc(it).cost, 6 * 30 + 120);
+      idx = (await call('GET', '/api/index')).body;
+      assert.equal(idx[T].pendingCost, 0);
+      assert.equal((await call('POST', `/api/day/${T}`, { type: 'fillPending' }, S)).status, 403);
+    });
+    await test('продавцу недоступны личные операции и перемещения', async () => {
+      assert.equal((await call('POST', `/api/day/${T}`, { type: 'upsertOp', op: { kind: 'personal', amount: 100, account: 'cash' } }, S)).status, 403);
+      assert.equal((await call('POST', `/api/day/${T}`, { type: 'upsertOp', op: { kind: 'transfer', amount: 100, account: 'kaspi', to: 'cash' } }, S)).status, 403);
+      await call('POST', `/api/day/${T}`, { type: 'upsertOp', op: { kind: 'personal', category: 'Еда', amount: 700, account: 'kaspi' } });
+      const r = await call('POST', `/api/day/${T}`, { type: 'upsertOp', op: { id: 'o1', kind: 'business', category: 'Хозяйственные нужды', amount: 300, account: 'cash' } }, S);
+      assert.equal(r.status, 200);
+      assert.equal(r.body.value.ops.length, 1, 'продавец видит только свои операции');
+    });
+    await test('удаление продажи продавцом видно руководителю', async () => {
+      await call('POST', `/api/day/${T}`, { type: 'upsertSale', sale: { id: 'p3', seller: 'Дана', items: [{ type: 'perfume', name: 'Black Opium', volume: 10, price: 5000 }], pay: { cash: 5000 } } }, S);
+      assert.equal((await call('POST', `/api/day/${T}`, { type: 'removeSale', id: 'p3' }, S)).status, 400);
+      await call('POST', `/api/day/${T}`, { type: 'removeSale', id: 'p3', reason: 'клиент передумал' }, S);
+      const idx = (await call('GET', '/api/index')).body;
+      assert.deepEqual(idx[T].sellerDeletions, { count: 1, sum: 5000 });
+    });
+    await test('продавец сдаёт смену вслепую, затем изменения закрыты', async () => {
+      let r = await call('POST', `/api/day/${T}`, { type: 'submit', closing: { kaspiTerminal: 4000, transfersReported: 0, cashSalesReported: 10000, cashActual: 21700 } }, S);
+      assert.equal(r.status, 422);
+      await call('PUT', `/api/photo/${T}`, { dataUrl: 'data:image/jpeg;base64,AAAA' }, S);
+      r = await call('POST', `/api/day/${T}`, { type: 'submit', time: '21:00', closing: { kaspiTerminal: 4000, transfersReported: 0, cashSalesReported: 10000, cashActual: 21700 } }, S);
+      assert.equal(r.status, 200);
+      assert.ok(r.body.value.closing.submittedAt);
+      assert.equal(r.body.value.closing.commission, undefined);
+      assert.equal((await call('POST', `/api/day/${T}`, { type: 'upsertSale', sale: { items: [perfume()], pay: { cash: 10000 } } }, S)).status, 423);
+      const own = (await call('GET', `/api/day/${T}`)).body.value;
+      const t = C.dayTotals(own);
+      // 12000 + 10000 наличными − 300 расход продавца
+      assert.equal(t.balances.cash.calc, 21700);
+      assert.equal(t.balances.cash.diff, 0);
+      assert.equal(own.sellers[0].end, '21:00');
+    });
+    await test('руководитель подтверждает остатки и закрывает смену', async () => {
+      const own = (await call('GET', `/api/day/${T}`)).body.value;
+      await call('POST', `/api/day/${T}`, { type: 'setOpening', opening: { ...own.opening, kaspi: 0, transfer: 0 } });
+      await call('POST', `/api/day/${T}`, { type: 'setClosing', closing: { commission: 40, kaspiActual: 3260, transferActual: 0 } });
+      const r = await call('POST', `/api/day/${T}`, { type: 'close' });
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const idx = (await call('GET', '/api/index')).body;
+      assert.equal(idx[T].openingUnconfirmed, false);
+      assert.equal(idx[T].disc.length, 0);
+    });
   } finally {
     srv.close();
-    delete process.env.ACCESS_PIN;
+    delete process.env.OWNER_PIN;
   }
 }
 

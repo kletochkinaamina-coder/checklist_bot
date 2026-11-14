@@ -5,7 +5,7 @@
 const crypto = require('crypto');
 const Calc = require('../public/calc.js');
 const { createStore } = require('./store');
-const { mutateDay, HttpError, K, DATE_RE } = require('./db');
+const { mutateDay, viewFor, HttpError, K, DATE_RE } = require('./db');
 
 let cached = null;
 function getStore() {
@@ -37,25 +37,76 @@ async function readBody(req) {
   return s ? JSON.parse(s) : {};
 }
 
-function pinOk(given) {
-  const pin = process.env.ACCESS_PIN;
-  if (!pin) return true;
-  const a = Buffer.from(String(given || ''));
-  const b = Buffer.from(String(pin));
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+const ownerPin = () => process.env.OWNER_PIN || process.env.ACCESS_PIN || '';
+const sha = (salt, pin) => crypto.createHash('sha256').update(`${salt}:${pin}`).digest('hex');
+
+function same(a, b) {
+  const x = Buffer.from(String(a || ''));
+  const y = Buffer.from(String(b || ''));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
 function clientIp(req) {
   return String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'local').split(',')[0].trim();
 }
 
-async function checkAuth(req, store) {
-  if (!process.env.ACCESS_PIN) return;
-  const failKey = `am:fail:${clientIp(req)}`;
-  if (pinOk(req.headers['x-pin'])) return;
-  const n = await store.incr(failKey, 15 * 60);
+/**
+ * Роль по PIN: руководитель (OWNER_PIN в переменных Vercel) или продавец
+ * (PIN продавцов задаёт руководитель в кабинете, хранится в виде хэша).
+ * Если OWNER_PIN не задан, все входят как руководитель (локальная работа).
+ */
+async function resolveRole(req, store) {
+  const owner = ownerPin();
+  if (!owner) return 'owner';
+  const given = String(req.headers['x-pin'] || '');
+  if (given && same(given, owner)) return 'owner';
+  if (given) {
+    const rec = await store.getRaw(K.sellerPin);
+    if (rec) {
+      const [salt, hash] = String(rec).split(':');
+      if (same(sha(salt, given), hash)) return 'seller';
+    }
+  }
+  const n = await store.incr(`am:fail:${clientIp(req)}`, 15 * 60);
   if (n > 20) throw new HttpError(429, 'Слишком много неверных попыток. Подождите 15 минут.');
   throw new HttpError(401, 'Неверный PIN');
+}
+
+const ownerOnly = (role) => {
+  if (role !== 'owner') throw new HttpError(403, 'Доступно только руководителю');
+};
+
+/** Дата по времени Казахстана (UTC+5). Продавцу доступны только сегодня и соседние дни. */
+function kzToday(now = Date.now()) {
+  return new Date(now + 5 * 3600 * 1000).toISOString().slice(0, 10);
+}
+function sellerDateOk(date) {
+  const t = Date.parse(`${kzToday()}T00:00:00Z`);
+  const d = Date.parse(`${date}T00:00:00Z`);
+  return Math.abs(d - t) <= 86400 * 1000;
+}
+
+/** Справочник для продавца: названия без закупочных цен и без зарплат. */
+function settingsForSeller(s) {
+  return {
+    basePrice: null,
+    concentration: s.concentration,
+    perfumeBottles: Object.fromEntries(Object.keys(s.perfumeBottles || {}).map((k) => [k, null])),
+    oilBottles: Object.fromEntries(Object.keys(s.oilBottles || {}).map((k) => [k, null])),
+    oils: (s.oils || []).map((o) => ({ id: o.id, name: o.name })),
+    goods: (s.goods || []).map((g) => ({ id: g.id, name: g.name })),
+    sellers: (s.sellers || []).map((x) => ({ name: x.name })),
+    changeLog: [],
+  };
+}
+
+async function prevBalances(store, date) {
+  const idx = await store.hgetall(K.index);
+  const dates = Object.keys(idx).filter((d) => d < date).sort();
+  if (!dates.length) return {};
+  const c = idx[dates[dates.length - 1]].closing || {};
+  const v = (acc) => (c[acc] ? (c[acc].fact === null ? c[acc].calc : c[acc].fact) : 0);
+  return { kaspi: v('kaspi'), transfer: v('transfer'), transferTracked: !c.transfer || c.transfer.tracked !== false };
 }
 
 function cleanSettings(v) {
@@ -103,21 +154,39 @@ async function handle(req, res) {
     const m = req.method;
 
     if (p === '/api/health') {
-      return send(res, 200, { ok: true, store: kind, auth: !!process.env.ACCESS_PIN });
-    }
-    if (p === '/api/login' && m === 'POST') {
-      await checkAuth(req, store);
-      return send(res, 200, { ok: true });
+      return send(res, 200, { ok: true, store: kind, auth: !!ownerPin(), today: kzToday() });
     }
 
-    await checkAuth(req, store);
+    const role = await resolveRole(req, store);
+
+    if ((p === '/api/login' && m === 'POST') || p === '/api/me') {
+      const sp = role === 'owner' ? !!(await store.getRaw(K.sellerPin)) : undefined;
+      return send(res, 200, { ok: true, role, today: kzToday(), sellerPinSet: sp });
+    }
+
+    if (p === '/api/seller-pin' && m === 'PUT') {
+      ownerOnly(role);
+      const body = await readBody(req);
+      const pin = String(body.pin || '').trim();
+      if (!pin) {
+        await store.delRaw(K.sellerPin);
+        return send(res, 200, { ok: true, set: false });
+      }
+      if (!/^\d{4,12}$/.test(pin)) throw new HttpError(400, 'PIN продавцов: от 4 до 12 цифр');
+      if (same(pin, ownerPin())) throw new HttpError(400, 'PIN продавцов не должен совпадать с PIN руководителя');
+      const salt = crypto.randomBytes(8).toString('hex');
+      await store.setRaw(K.sellerPin, `${salt}:${sha(salt, pin)}`);
+      return send(res, 200, { ok: true, set: true });
+    }
 
     if (p === '/api/settings') {
       if (m === 'GET') {
         const cur = await store.get(K.settings);
-        return send(res, 200, { rev: cur ? cur.rev : 0, value: Calc.withDefaults(cur && cur.value) });
+        const value = Calc.withDefaults(cur && cur.value);
+        return send(res, 200, { rev: cur ? cur.rev : 0, value: role === 'owner' ? value : settingsForSeller(value) });
       }
       if (m === 'PUT') {
+        ownerOnly(role);
         const body = await readBody(req);
         const value = cleanSettings(body.value);
         const ok = await store.cas(K.settings, Number(body.rev) || 0, value);
@@ -127,23 +196,34 @@ async function handle(req, res) {
     }
 
     if (p === '/api/index' && m === 'GET') {
+      ownerOnly(role);
       return send(res, 200, await store.hgetall(K.index));
     }
 
-    let mm = p.match(/^\/api\/day\/(\d{4}-\d{2}-\d{2})$/);
+    let mm = p.match(/^\/api\/(day|photo)\/(\d{4}-\d{2}-\d{2})$/);
+    if (mm && role === 'seller' && !sellerDateOk(mm[2])) {
+      throw new HttpError(403, 'Продавцу доступна только текущая смена');
+    }
+
+    mm = p.match(/^\/api\/day\/(\d{4}-\d{2}-\d{2})$/);
     if (mm) {
       const date = mm[1];
       if (m === 'GET') {
         const cur = await store.get(K.day(date));
-        return send(res, 200, cur || { rev: 0, value: null });
+        return send(res, 200, cur ? { rev: cur.rev, value: viewFor(cur.value, role) } : { rev: 0, value: null });
       }
       if (m === 'POST') {
         const body = await readBody(req);
-        return send(res, 200, await mutateDay(store, date, body));
+        const cur = await store.get(K.settings);
+        const ctx = { role, settings: Calc.withDefaults(cur && cur.value) };
+        if (body.type === 'open' && role === 'seller') ctx.prev = await prevBalances(store, date);
+        const r = await mutateDay(store, date, body, ctx);
+        return send(res, 200, { rev: r.rev, value: viewFor(r.value, role) });
       }
     }
 
     if (p === '/api/range' && m === 'GET') {
+      ownerOnly(role);
       const from = url.searchParams.get('from');
       const to = url.searchParams.get('to');
       if (!DATE_RE.test(from || '') || !DATE_RE.test(to || '')) throw new HttpError(400, 'Неверный период');
@@ -163,18 +243,19 @@ async function handle(req, res) {
         const dataUrl = String(body.dataUrl || '');
         if (!/^data:image\/(jpeg|png|webp);base64,/.test(dataUrl)) throw new HttpError(400, 'Нужна картинка');
         if (dataUrl.length > 3 * 1024 * 1024) throw new HttpError(413, 'Фото слишком большое');
-        const day = await mutateDay(store, date, { type: 'setPhoto', has: true });
+        const day = await mutateDay(store, date, { type: 'setPhoto', has: true }, { role });
         await store.setRaw(K.photo(date), dataUrl);
-        return send(res, 200, day);
+        return send(res, 200, { rev: day.rev, value: viewFor(day.value, role) });
       }
       if (m === 'DELETE') {
-        const day = await mutateDay(store, date, { type: 'setPhoto', has: false });
+        const day = await mutateDay(store, date, { type: 'setPhoto', has: false }, { role });
         await store.delRaw(K.photo(date));
-        return send(res, 200, day);
+        return send(res, 200, { rev: day.rev, value: viewFor(day.value, role) });
       }
     }
 
     if (p === '/api/export' && m === 'GET') {
+      ownerOnly(role);
       const settings = await store.get(K.settings);
       const idx = await store.hgetall(K.index);
       const dates = Object.keys(idx).sort();

@@ -119,22 +119,30 @@
     };
   }
 
-  /** Что не заполнено в позиции. Пустой массив = можно сохранять. */
+  /** Не заполненные данные себестоимости (их знает только руководитель). */
+  function costMissing(it) {
+    const m = [];
+    if (it.type === 'perfume' || it.type === 'oil') {
+      if (!(num(it.oilPrice) > 0)) m.push('закупочная цена масла за 1 мл');
+      if (blank(it.bottleCost)) m.push('стоимость флакона');
+    }
+    if (it.type === 'perfume' && blank(it.basePrice)) m.push('цена основы');
+    if (it.type === 'other' && blank(it.unitCost)) m.push('закупочная стоимость товара');
+    return m;
+  }
+
+  /** Что не заполнено в позиции. Пустой массив = можно сохранять.
+   *  Позиция с costPending (продал продавец, цены нет в справочнике) сохраняется без себестоимости. */
   function itemMissing(it) {
     const m = [];
     if (!['perfume', 'oil', 'other'].includes(it.type)) m.push('вид продукта');
     if (blank(it.name)) m.push(it.type === 'other' ? 'название товара' : 'аромат');
-    if (it.type === 'perfume' || it.type === 'oil') {
-      if (!(num(it.volume) > 0)) m.push('объём');
-      if (!(num(it.oilPrice) > 0)) m.push('закупочная цена масла за 1 мл');
-      if (blank(it.bottleCost)) m.push('стоимость флакона');
-    }
+    if ((it.type === 'perfume' || it.type === 'oil') && !(num(it.volume) > 0)) m.push('объём');
     if (it.type === 'perfume') {
       const c = num(it.conc);
       if (!(c > 0 && c <= 100)) m.push('концентрация масла');
-      if (blank(it.basePrice)) m.push('цена основы');
     }
-    if (it.type === 'other' && blank(it.unitCost)) m.push('закупочная стоимость товара');
+    if (!it.costPending) m.push(...costMissing(it));
     if (!it.gift && !(num(it.price) > 0)) m.push('фактическая цена продажи');
     if (!it.gift && !blank(it.fullPrice) && num(it.fullPrice) < num(it.price)) m.push('цена до скидки меньше цены продажи');
     return m;
@@ -164,8 +172,10 @@
       discounts: 0,
       positions: 0,
       pay: { kaspi: 0, transfer: 0, cash: 0 },
+      pendingCost: 0,
     };
     for (const { it, c } of items) {
+      if (it.costPending) out.pendingCost += 1;
       out.revenue += c.price;
       out.cost += c.cost;
       if (it.gift) {
@@ -232,6 +242,7 @@
       sellers: {},
       unknownSellerSales: 0,
       payMismatch: 0,
+      pendingCost: 0,
     };
     const sellers = day.sellers || [];
     for (const s of sellers) {
@@ -246,6 +257,7 @@
       const name = blank(sale.seller) ? NO_SELLER : sale.seller;
       if (name === NO_SELLER) t.unknownSellerSales += 1;
       if (!c.payOk) t.payMismatch += 1;
+      t.pendingCost += c.pendingCost;
       const st = (t.sellers[name] = t.sellers[name] || sellerStat(name));
       t.revenue += c.revenue;
       t.receipts += 1;
@@ -390,7 +402,18 @@
       payMismatch: t.payMismatch,
       commissionEntered: t.commission !== null,
       closedWithGaps: !!cl.closedWithGaps,
+      pendingCost: t.pendingCost,
+      openingConfirmed: op0.confirmed !== false,
+      submittedAt: cl.submittedAt || null,
     };
+    // Удаления продаж продавцом: руководитель видит их в контроле
+    t.sellerDeletions = { count: 0, sum: 0 };
+    for (const l of day.log || []) {
+      if (l.a === 'removeSale' && l.by === 'seller' && l.d && l.d.removed) {
+        t.sellerDeletions.count += 1;
+        t.sellerDeletions.sum = r2(t.sellerDeletions.sum + saleCalc(l.d.removed).revenue);
+      }
+    }
     t.missing = closingMissing(day);
     return t;
   }
@@ -454,6 +477,15 @@
       disc: disc.map((d) => ({ key: d.key, label: d.label, diff: d.diff, calc: d.calc, fact: d.fact, resolved: !!d.resolved, comment: d.comment || '' })),
       missing: day.status === 'closed' ? [] : t.missing,
       closedWithGaps: !!(day.closing || {}).closedWithGaps,
+      pendingCost: t.pendingCost,
+      openingUnconfirmed: !t.control.openingConfirmed,
+      submittedAt: t.control.submittedAt,
+      sellerDeletions: t.sellerDeletions,
+      salaryUnpaid: t.salaryUnpaid,
+      unclearOps: t.unclearOps,
+      commissionMissing: t.commission === null && t.pay.kaspi > 0,
+      payMismatch: t.payMismatch,
+      unknownSellerSales: t.unknownSellerSales,
     };
   }
 
@@ -475,6 +507,7 @@
       gifts: 0,
       discount: 0,
       discounts: 0,
+      pendingCost: 0,
       salaries: 0,
       salaryUnpaid: 0,
       commission: 0,
@@ -494,7 +527,7 @@
     for (const day of days) {
       const t = dayTotals(day);
       if (day.status === 'closed') R.closed += 1;
-      for (const k of ['revenue', 'receipts', 'positions', 'cogs', 'giftCost', 'gifts', 'discount', 'discounts', 'salaries', 'salaryUnpaid', 'business', 'refunds', 'purchases', 'personal']) {
+      for (const k of ['revenue', 'receipts', 'positions', 'cogs', 'giftCost', 'gifts', 'discount', 'discounts', 'pendingCost', 'salaries', 'salaryUnpaid', 'business', 'refunds', 'purchases', 'personal']) {
         R[k] += t[k];
       }
       for (const p of PAY) R.pay[p] += t.pay[p];
@@ -573,11 +606,11 @@
     L.push('');
     L.push('2. Себестоимость');
     for (const ln of t.lines) {
-      L.push(`• ${itemTitle(ln.it)}${ln.it.gift ? ' (подарок)' : ''}: ${money(ln.c.cost)}`);
+      L.push(`• ${itemTitle(ln.it)}${ln.it.gift ? ' (подарок)' : ''}: ${ln.it.costPending ? 'не определена, нет закупочной цены' : money(ln.c.cost)}`);
     }
     if (!t.lines.length) L.push('• Продаж нет');
     L.push(`• Себестоимость подарков: ${money(t.giftCost)}`);
-    L.push(`• Общая себестоимость: ${money(t.cogs)}`);
+    L.push(`• Общая себестоимость: ${money(t.cogs)}${t.pendingCost ? ` (без ${t.pendingCost} поз. без цены)` : ''}`);
     L.push('');
     L.push('3. Прибыль');
     L.push(`• Выручка: ${money(t.revenue)}`);
@@ -628,6 +661,9 @@
     L.push(`• Все продажи внесены: ${t.check.terminal && t.check.terminal.diff === 0 && (!t.check.cashSales || t.check.cashSales.diff === 0) && (!t.check.transfers || t.check.transfers.diff === 0) ? 'да' : 'требует проверки'}`);
     L.push(`• Неподтверждённые операции: ${t.unclearOps}`);
     if (t.unknownSellerSales) L.push(`• Продажи без продавца: ${t.unknownSellerSales}`);
+    if (t.pendingCost) L.push(`• Позиции без себестоимости: ${t.pendingCost}, прибыль завышена`);
+    if (!t.control.openingConfirmed) L.push('• Начальные остатки Kaspi и переводов не подтверждены руководителем');
+    if (t.sellerDeletions.count) L.push(`• Продавец удалил продаж: ${t.sellerDeletions.count} на ${money(t.sellerDeletions.sum)}`);
     if (t.payMismatch) L.push(`• Чеки, где оплата не равна сумме: ${t.payMismatch}`);
     if (t.salaryUnpaid) L.push(`• Зарплата не выплачена: ${money(t.salaryUnpaid)}`);
     if (day.status !== 'closed' && t.missing.length) L.push(`• Не хватает для закрытия: ${t.missing.join(', ')}`);
@@ -641,7 +677,7 @@
     L.push('');
     L.push('Финансовый результат');
     L.push(`• Выручка: ${money(R.revenue)} (Kaspi Pay ${money(R.pay.kaspi)}, переводы ${money(R.pay.transfer)}, наличные ${money(R.pay.cash)})`);
-    L.push(`• Себестоимость проданных товаров: ${money(R.cogs)} (в т.ч. подарки ${money(R.giftCost)})`);
+    L.push(`• Себестоимость проданных товаров: ${money(R.cogs)} (в т.ч. подарки ${money(R.giftCost)})${R.pendingCost ? `. Без себестоимости: ${R.pendingCost} поз.` : ''}`);
     L.push(`• Валовая прибыль: ${money(R.gross)}`);
     L.push(`• Зарплаты: ${money(R.salaries)}${R.salaryUnpaid ? ` (не выплачено ${money(R.salaryUnpaid)})` : ''}`);
     L.push(`• Комиссии Kaspi: ${money(R.commission)}${R.commissionMissingDays ? ` (не указана за ${R.commissionMissingDays} дн.)` : ''}`);
@@ -717,6 +753,7 @@
     tableValue,
     itemCalc,
     itemMissing,
+    costMissing,
     itemTitle,
     saleCalc,
     dayTotals,
