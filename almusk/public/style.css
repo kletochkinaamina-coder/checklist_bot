@@ -314,3 +314,15 @@ td.neg { color: var(--bad); }
 .dash-tip { position: fixed; z-index: 90; pointer-events: none; white-space: pre-line; background: var(--ink); color: var(--bg); padding: 8px 10px; border-radius: 10px; font-size: 13px; line-height: 1.4; max-width: 260px; box-shadow: 0 4px 16px rgba(0,0,0,.2); }
 .dash-tip[hidden] { display: none; }
 details summary { cursor: pointer; color: var(--muted); margin-top: 6px; }
+
+.be-bar { height: 12px; border-radius: 6px; background: var(--field); border: 1px solid var(--line); overflow: hidden; margin: 10px 0 6px; }
+.be-bar > div { height: 100%; background: var(--s1); border-radius: 6px; }
+.tips { display: grid; gap: 8px; }
+.tip { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; padding: 10px 12px; border-radius: 10px; background: var(--field); border: 1px solid var(--line); }
+.tip .ic { flex: none; width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; }
+.tip.good .ic { background: var(--ok-soft); color: var(--ok); }
+.tip.warn .ic { background: var(--warn-soft); color: var(--warn); }
+.tip.bad .ic { background: var(--bad-soft); color: var(--bad); }
+.tip.info .ic { background: var(--gold-soft); color: var(--gold); }
+
+@media (max-width: 520px) { .hide-sm { display: none; } }

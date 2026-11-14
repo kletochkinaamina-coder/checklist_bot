@@ -94,9 +94,10 @@
       for (const ln of t.lines) {
         if (ln.it.gift) continue;
         const key = ln.it.type === 'other' ? 'Товары' : `${ln.it.type === 'oil' ? 'Масло' : 'Духи'} ${C.fmt(C.num(ln.it.volume))} мл`;
-        const v = (volumes[key] = volumes[key] || { name: key, count: 0, revenue: 0 });
+        const v = (volumes[key] = volumes[key] || { name: key, count: 0, revenue: 0, cost: 0 });
         v.count += ln.c.qty;
         v.revenue += ln.c.price;
+        v.cost += ln.c.cost;
       }
       const w = week[wdOf(date)];
       w.revenue += t.revenue;
@@ -253,14 +254,107 @@
     return `<div class="kpi ${hl ? 'hl' : ''}"><div class="l">${esc(label)}</div><div class="v">${fmt(cur)}</div>${delta}${note ? `<div class="dl">${note}</div>` : ''}</div>`;
   }
 
+  /* ---------- Советы ---------- */
+
+  function insights({ R, P, A, be, stock, today }) {
+    const T = [];
+    const add = (lvl, text) => T.push({ lvl, text });
+    const pctS = (x) => `${Math.round(x)}%`;
+    if (R.pendingCost) add('bad', `У ${R.pendingCost} проданных позиций нет себестоимости: прибыль завышена. Укажите цены этих ароматов в Справочнике.`);
+    // Безубыточность
+    if (be && be.monthly) {
+      if (be.net >= 0) add('good', `С учётом аренды период в плюсе: ${M(be.net)}.`);
+      else add('bad', `С учётом аренды период в убытке: ${M(be.net)}. Постоянных расходов начислено ${M(be.fixedAccrued)}, а заработано до них ${M(be.operating)}.`);
+      if (be.needPerShift !== null && be.avgRevenue) {
+        const gap = be.avgRevenue - be.needPerShift;
+        if (gap >= 0) add('good', `Средняя смена ${M(be.avgRevenue)} выше точки безубыточности ${M(be.needPerShift)} на ${M(gap)}.`);
+        else add('warn', `Средняя смена ${M(be.avgRevenue)} ниже точки безубыточности ${M(be.needPerShift)}: не хватает ${M(-gap)} в день${R.avgCheck ? `, это примерно ${Math.ceil(-gap / R.avgCheck)} доп. чеков` : ''}.`);
+      }
+    } else {
+      add('info', 'Укажите аренду в Справочнике: тогда будет видно, в плюсе ли магазин с учётом постоянных расходов и сколько нужно продавать в день.');
+    }
+    // Динамика
+    if (P && P.revenue) {
+      const ch = ((R.revenue - P.revenue) / P.revenue) * 100;
+      if (Math.abs(ch) >= 5) add(ch > 0 ? 'good' : 'warn', `Выручка ${ch > 0 ? 'выросла' : 'упала'} на ${pctS(Math.abs(ch))} к прошлому периоду${P.avgCheck ? `, средний чек ${R.avgCheck >= P.avgCheck ? 'вырос' : 'снизился'} с ${M(P.avgCheck)} до ${M(R.avgCheck)}` : ''}.`);
+    }
+    // Склад
+    if (stock) {
+      const tracked = stock.filter((i) => i.tracked);
+      if (!tracked.some((i) => i.revCount !== null || i.received > 0)) {
+        add('info', 'Склад ещё не заполнен: проведите первую ревизию во вкладке «Склад», тогда появятся остатки и советы по закупу.');
+      } else {
+        const ending = tracked.filter((i) => i.cons30 > 0 && i.daysLeft !== null && i.daysLeft <= 10 && !i.negative).sort((a, b) => a.daysLeft - b.daysLeft);
+        if (ending.length) add('warn', `Скоро закончится: ${ending.slice(0, 5).map((i) => `${i.name} (на ${i.daysLeft} дн.)`).join(', ')}. Закупите заранее, это ходовые позиции.`);
+        const neg = tracked.filter((i) => i.negative);
+        if (neg.length) add('bad', `${neg.length} поз. ушли в минус по складу: продано больше, чем было по учёту. Внесите пропущенный приход или проведите ревизию.`);
+        // «Не продаётся»: остаток лежит без продаж больше 30 дней с последнего прихода или ревизии
+        const since = (i) => [i.lastDate, i.revDate].filter(Boolean).sort().pop() || '0000-00-00';
+        const dead = tracked.filter((i) => i.kind === 'oil' && i.qty > 0 && i.cons30 === 0 && since(i) <= C.isoAdd(today, -30));
+        if (dead.length) {
+          const val = dead.reduce((a, i) => a + (i.value || 0), 0);
+          add('info', `Без продаж 30 дней: ${dead.length} аромат${dead.length === 1 ? '' : 'ов'} на ${M(val)} (${dead.slice(0, 4).map((i) => i.name).join(', ')}${dead.length > 4 ? '…' : ''}). Не докупайте их, давайте понюхать клиентам или в подарок по 2+1.`);
+        }
+      }
+    }
+    // Объёмы: что выгоднее
+    const vols = A.volumes.filter((v) => v.count >= 3);
+    if (vols.length >= 2) {
+      const per = vols.map((v) => ({ ...v, profit: (v.revenue - v.cost) / v.count }));
+      const best = per.reduce((m, v) => (v.profit > m.profit ? v : m), per[0]);
+      const popular = per.reduce((m, v) => (v.count > m.count ? v : m), per[0]);
+      if (best.name !== popular.name) add('info', `Больше всего прибыли с одной продажи даёт «${best.name}» (${M(best.profit)}), а чаще всего берут «${popular.name}» (${M(popular.profit)}). Предлагайте клиентам ${best.name}.`);
+      else add('good', `«${best.name}» и самый популярный, и самый прибыльный объём: ${M(best.profit)} прибыли с продажи.`);
+    }
+    // Ароматы-лидеры
+    const aromaRev = R.topAromas.reduce((a, x) => a + x.revenue, 0);
+    if (R.topAromas.length >= 8 && aromaRev) {
+      const top5 = R.topAromas.slice(0, 5);
+      const share = (top5.reduce((a, x) => a + x.revenue, 0) / aromaRev) * 100;
+      add('info', `5 лидеров дают ${pctS(share)} выручки ароматов: ${top5.map((a) => a.name).join(', ')}. Держите их всегда в наличии.`);
+    }
+    // Часы и дни недели
+    const peak = A.hours.reduce((m, h) => (h.revenue > m.revenue ? h : m), A.hours[0]);
+    const wk = A.week.filter((w) => w.days);
+    if (peak.revenue && wk.length >= 4) {
+      const weak = wk.reduce((m, w) => (w.avg < m.avg ? w : m), wk[0]);
+      const strong = wk.reduce((m, w) => (w.avg > m.avg ? w : m), wk[0]);
+      add('info', `Пик продаж ${String(peak.h).padStart(2, '0')}:00–${String(peak.h + 1).padStart(2, '0')}:00: в это время в магазине должно быть больше людей. Сильный день ${strong.l} (${M(strong.avg)}), слабый ${weak.l} (${M(weak.avg)}): в слабый день можно запускать акцию.`);
+    }
+    // Продавцы
+    const sl = R.sellerRank.filter((x) => x.receipts >= 5);
+    if (sl.length >= 2) {
+      const hi = sl.reduce((m, x) => (x.avgCheck > m.avgCheck ? x : m), sl[0]);
+      const lo = sl.reduce((m, x) => (x.avgCheck < m.avgCheck ? x : m), sl[0]);
+      const d = lo.avgCheck ? ((hi.avgCheck - lo.avgCheck) / lo.avgCheck) * 100 : 0;
+      if (d >= 15) add('info', `Средний чек у ${hi.name} на ${pctS(d)} выше, чем у ${lo.name} (${M(hi.avgCheck)} против ${M(lo.avgCheck)}): стоит обменяться приёмами допродажи.`);
+    }
+    // Подарки и комиссии
+    if (R.gross > 0 && R.giftCost / R.gross > 0.05) add('warn', `Подарки по акциям забрали ${pctS((R.giftCost / R.gross) * 100)} валовой прибыли (${M(R.giftCost)}). Проверьте, окупается ли акция.`);
+    if (R.pay.kaspi > 0 && R.commission > 0) {
+      const c = (R.commission / R.pay.kaspi) * 100;
+      if (c >= 0.8) add('info', `Комиссия Kaspi Pay ${c.toLocaleString('ru-RU', { maximumFractionDigits: 1 })}% (${M(R.commission)} за период). Переводы проходят без неё.`);
+    }
+    const order = { bad: 0, warn: 1, good: 2, info: 3 };
+    return T.sort((a, b) => order[a.lvl] - order[b.lvl]);
+  }
+
+  const ICON = { bad: '!', warn: '!', good: '✓', info: 'i' };
+  const tipsHtml = (list) => `<div class="tips">${list.map((t) => `<div class="tip ${t.lvl}"><span class="ic">${ICON[t.lvl]}</span><span>${esc(t.text)}</span></div>`).join('')}</div>`;
+
   /* ---------- Сборка ---------- */
 
   let mounted = null;
 
-  function mount(root, { days, prev, from, to }) {
+  function mount(root, { days, prev, from, to, settings, stock, today }) {
     const A = aggregate(days, from, to);
     const P = prev ? C.rangeTotals(prev) : null;
     const R = A.R;
+    const be = settings ? C.breakeven(days, settings, from, to, today) : null;
+    const tips = insights({ R, P, A, be, stock, today: today || to });
+    const tracked = stock ? stock.filter((i) => i.tracked) : [];
+    const stockValue = tracked.reduce((a, i) => a + (i.value || 0), 0);
+    const ending = tracked.filter((i) => i.cons30 > 0 && i.daysLeft !== null).sort((a, b) => a.daysLeft - b.daysLeft).slice(0, 6);
     const pct = (n) => `${n.toLocaleString('ru-RU', { maximumFractionDigits: 0 })}%`;
     const margin = R.revenue ? (R.gross / R.revenue) * 100 : 0;
     const pMargin = P && P.revenue ? (P.gross / P.revenue) * 100 : null;
@@ -280,7 +374,13 @@
     ];
 
     root.innerHTML = `
-      ${R.pendingCost ? `<div class="note bad small">Позиций без себестоимости: ${R.pendingCost}. Прибыль на графиках завышена.</div>` : ''}
+      <section class="card"><h3>Советы</h3>${tipsHtml(tips)}</section>
+      ${be && be.monthly ? `<div class="kpis">
+        ${tile('Итог с учётом аренды', be.net, null, M, { hl: true, note: be.net >= 0 ? 'в плюсе' : 'убыток' })}
+        ${tile('Аренда за период', be.fixedAccrued, null, M, { note: `${M(be.monthly)} в месяц` })}
+        ${tile('Точка безубыточности', be.needPerShift === null ? 0 : be.needPerShift, null, M, { note: 'выручка за смену' })}
+        ${tile('Средняя смена', be.avgRevenue, null, M, { note: be.needPerShift !== null ? (be.avgRevenue >= be.needPerShift ? 'выше точки' : 'ниже точки') : '' })}
+      </div>` : ''}
       <div class="kpis">
         ${tile('Выручка', R.revenue, P && P.revenue, M, { hl: true })}
         ${tile('Валовая прибыль', R.gross, P && P.gross, M)}
@@ -343,6 +443,13 @@
           sub: M(v.revenue),
           tip: `${v.name}: ${v.count} шт., ${M(v.revenue)}`,
         })))}</section>
+        <section class="card"><h3>Склад</h3>
+          ${stock ? `<p>Остатки на ${M(stockValue)} по закупочной цене, позиций в учёте: ${tracked.length}.</p>
+            ${ending.length ? `<h3 style="margin-top:10px">Закончится раньше всего</h3>${hbars(ending.map((i) => ({ label: i.name, sub: `осталось ${C.fmt(i.qty)} ${i.unit}`, value: Math.max(i.daysLeft, 0.2), text: `${i.daysLeft} дн.`, color: i.daysLeft <= 7 ? '--s2' : '--s1', tip: `${i.name}\nОстаток ${C.fmt(i.qty)} ${i.unit}\nРасход за 30 дней ${C.fmt(i.cons30)} ${i.unit}\nХватит примерно на ${i.daysLeft} дн.` })), { max: Math.max(30, ...ending.map((i) => i.daysLeft)) })}` : '<p class="small muted">Пока нет данных о расходе.</p>'}
+            <div style="margin-top:10px"><button class="btn sm" data-act="tabStock">Открыть склад</button></div>` : '<p class="empty">Склад недоступен.</p>'}
+        </section>
+      </div>
+      <div class="dgrid">
         <section class="card"><h3>Остатки денег на конец дня</h3>
           ${legendHtml([{ label: 'Наличная касса', color: '--s1', line: true }, { label: 'Kaspi Pay', color: '--s2', line: true }])}
           <div class="chart" data-c="bal"></div>

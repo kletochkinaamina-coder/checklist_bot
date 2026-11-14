@@ -254,6 +254,9 @@
     } else if (S.tab === 'dash') {
       v.innerHTML = viewDash();
       loadDash();
+    } else if (S.tab === 'stock') {
+      v.innerHTML = window.Sklad.view();
+      window.Sklad.mount();
     } else if (S.tab === 'shift') v.innerHTML = S.day ? viewDay() : viewOpen();
     else if (S.tab === 'reports') {
       v.innerHTML = viewReports();
@@ -447,6 +450,7 @@
         ${kpi('Чеков / позиций', `${t.receipts} / ${t.positions}`)}
         ${kpi('Средний чек', M(t.avgCheck))}
       </div>
+      ${netNote(d, t)}
       ${open ? '<div class="actions"><button class="btn primary big" data-act="newSale">+ Продажа</button><button class="btn big" data-act="newOp">+ Расход или операция</button></div>' : ''}
       <section class="card"><h3>Продажи (${sales.length})</h3><div class="list">${sales.length ? sales.map((s) => saleHtml(s, open)).join('') : '<p class="empty">Продаж пока нет.</p>'}</div></section>
       <section class="card"><h3>Расходы и операции (${ops.length})</h3><div class="list">${ops.length ? ops.map((o) => opHtml(o, open)).join('') : '<p class="empty">Операций нет.</p>'}</div>
@@ -454,6 +458,16 @@
       <section class="card"><h3>Остатки денег</h3>${balancesTable(t)}</section>
       ${open ? closeCta(t) : closedBlock(d)}
       <section class="card"><div class="row between"><h3>Журнал изменений</h3><button class="btn sm" data-act="showLog">Показать</button></div><p class="small muted">${(d.log || []).length} записей: кто и что менял, удалённые продажи с причинами.</p></section>`;
+  }
+
+  /** Итог дня с учётом аренды: в плюсе или убыток. */
+  function netNote(d, t) {
+    if (!C.fixedMonthly(S.settings)) {
+      return '<p class="hint" style="margin:-6px 0 12px">Чтобы видеть, в плюсе ли день с учётом аренды, укажите постоянные расходы в Справочнике.</p>';
+    }
+    const n = C.dayNet(d, S.settings, t);
+    return `<div class="note ${n.net >= 0 ? 'ok' : 'bad'}">${n.net >= 0 ? '▲ День в плюсе' : '▼ День в убытке'} с учётом аренды: <b>${M(n.net)}</b>
+      <div class="small">Результат ${M(n.operating)} − постоянные расходы на день ${M(n.fixedDaily)} (${M(C.fixedMonthly(S.settings))} в месяц / ${C.daysInMonth(d.date)} дн.)${n.fixedPaid ? `. Оплата аренды ${M(n.fixedPaid)} в этот день учтена как месячная.` : ''}</div></div>`;
   }
 
   function ownerDayAlerts(d, t) {
@@ -511,7 +525,7 @@
   }
 
   function closedBlock(d) {
-    const text = C.dailyReportText(d);
+    const text = C.dailyReportText(d, isOwner() ? S.settings : null);
     return `<section class="card"><h3>Отчёт за день</h3>
       <div class="row wrap" style="margin-bottom:10px">
         <button class="btn sm primary" data-act="copyDay">Скопировать отчёт</button>
@@ -1325,6 +1339,7 @@
       } else {
         const days = await api('GET', `/api/range?from=${R.from}&to=${R.to}`);
         if (!out()) return;
+        S.rep.lastDays = days;
         out().innerHTML = rangeReportHtml(days);
       }
     } catch (err) {
@@ -1341,7 +1356,7 @@
 
   function dayReportHtml(day) {
     const t = C.dayTotals(day);
-    const text = C.dailyReportText(day);
+    const text = C.dailyReportText(day, isOwner() ? S.settings : null);
     const lines = t.lines.map((ln) => `<tr><td>${esc(ln.time || '')}</td><td>${esc(ln.seller)}</td><td>${esc(C.itemTitle(ln.it))}${ln.it.gift ? ' <span class="badge gold">подарок</span>' : ''}</td><td class="n">${ln.it.type === 'other' ? '' : C.fmt(ln.c.oilMl)}</td><td class="n">${ln.it.type === 'perfume' ? C.fmt(ln.c.baseMl) : ''}</td><td class="n">${ln.c.discount ? M(ln.c.fullPrice) : ''}</td><td class="n">${ln.c.discount ? M(ln.c.discount) : ''}</td><td class="n">${M(ln.c.price)}</td><td>${esc(ln.method)}</td><td class="n">${M(ln.c.cost)}</td><td class="n">${M(ln.c.profit)}</td></tr>`).join('');
     const sellers = Object.values(t.sellers);
     return `<div class="kpis">
@@ -1351,14 +1366,15 @@
       <section class="card"><h3>Все позиции</h3>${lines ? `<div class="tbl-wrap"><table><thead><tr><th>Время</th><th>Продавец</th><th>Позиция</th><th class="n">Масло, мл</th><th class="n">Основа, мл</th><th class="n">До скидки</th><th class="n">Скидка</th><th class="n">Цена</th><th>Оплата</th><th class="n">Себест.</th><th class="n">Прибыль</th></tr></thead><tbody>${lines}</tbody></table></div>` : '<p class="empty">Продаж нет.</p>'}</section>
       <section class="card"><h3>Остатки</h3>${balancesTable(t)}</section>
       <section class="card"><h3>Текст отчёта</h3>
-        <div class="row wrap" style="margin-bottom:10px"><button class="btn sm primary" data-act="copyReport">Скопировать</button><a class="btn sm" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(text)}">WhatsApp</a>${day.closing && day.closing.photo ? `<button class="btn sm" data-act="viewPhoto" data-date="${day.date}">Фото сверки</button>` : ''}</div>
+        <div class="row wrap" style="margin-bottom:10px"><button class="btn sm primary" data-act="copyReport">Скопировать</button><a class="btn sm" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(text)}">WhatsApp</a><button class="btn sm" data-act="xlsDay" data-date="${day.date}">Excel</button>${day.closing && day.closing.photo ? `<button class="btn sm" data-act="viewPhoto" data-date="${day.date}">Фото сверки</button>` : ''}</div>
         <div class="report" id="reportText">${esc(text)}</div></section>`;
   }
 
   function rangeReportHtml(days) {
     if (!days.length) return '<section class="card"><p class="empty">За период смен нет.</p></section>';
     const R = C.rangeTotals(days);
-    const text = C.rangeReportText(R);
+    const be = C.breakeven(days, S.settings, S.rep.from, S.rep.to, today());
+    const text = C.rangeReportText(R, null, be);
     const pl = [
       ['Выручка', R.revenue],
       ['Себестоимость проданных товаров (с подарками)', -R.cogs],
@@ -1368,6 +1384,7 @@
       ['Аренда и прочие расходы бизнеса', -R.business],
       ...(R.refunds ? [['Возвраты покупателям', -R.refunds]] : []),
       ['Чистый операционный результат', R.result, true],
+      ...(be.monthly ? [['Постоянные расходы за период (начислено)', -be.fixedAccrued], ['Итог с учётом аренды', be.net, true]] : []),
     ];
     const tbl = (rows) => `<table><tbody>${rows.map(([l, v, b]) => `<tr class="${b ? 'total' : ''}"><td>${esc(l)}</td><td class="n">${M(v)}</td></tr>`).join('')}</tbody></table>`;
     const cats = (obj) => Object.entries(obj).map(([c, v]) => [c, v]);
@@ -1388,7 +1405,7 @@
       <section class="card"><h3>Самые продаваемые ароматы</h3>${R.topAromas.length ? `<div class="tbl-wrap"><table><thead><tr><th>#</th><th>Аромат</th><th class="n">Продано</th><th class="n">Подарено</th><th class="n">Масла, мл</th><th class="n">Выручка</th><th class="n">Себест.</th></tr></thead><tbody>${R.topAromas.slice(0, 20).map((a, i) => `<tr><td>${i + 1}</td><td>${esc(a.name)}</td><td class="n">${a.sold}</td><td class="n">${a.gifts}</td><td class="n">${C.fmt(a.ml)}</td><td class="n">${M(a.revenue)}</td><td class="n">${M(a.cost)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="empty">Нет продаж ароматов.</p>'}</section>
       <section class="card"><h3>По дням</h3><div class="tbl-wrap"><table><thead><tr><th>Дата</th><th class="n">Чеков</th><th class="n">Выручка</th><th class="n">Вал. прибыль</th><th class="n">Результат</th><th>Статус</th></tr></thead><tbody>${R.perDay.map((d) => `<tr><td><button class="link" data-act="repDay" data-date="${d.date}">${C.dmy(d.date)}</button></td><td class="n">${d.receipts}</td><td class="n">${M(d.revenue)}</td><td class="n">${M(d.gross)}</td><td class="n">${M(d.result)}</td><td>${d.status === 'closed' ? 'закрыта' : '<span class="badge warn">открыта</span>'}</td></tr>`).join('')}</tbody></table></div></section>
       <section class="card"><h3>Расхождения</h3>${R.disc.length ? `<ul>${R.disc.map((d) => `<li>${C.dmy(d.date)} · ${esc(d.label)}: <b>${C.signed(d.diff)}</b> ${d.resolved ? '<span class="badge ok">выяснено</span>' : '<span class="badge bad">не выяснено</span>'}${d.comment ? ` · ${esc(d.comment)}` : ''}</li>`).join('')}</ul>` : '<p class="empty">Нет.</p>'}</section>
-      <section class="card"><h3>Текст отчёта</h3><div class="row wrap" style="margin-bottom:10px"><button class="btn sm primary" data-act="copyReport">Скопировать</button></div><div class="report" id="reportText">${esc(text)}</div></section>`;
+      <section class="card"><h3>Текст отчёта</h3><div class="row wrap" style="margin-bottom:10px"><button class="btn sm primary" data-act="copyReport">Скопировать</button><button class="btn sm" data-act="xlsRange">Скачать Excel</button></div><div class="report" id="reportText">${esc(text)}</div></section>`;
   }
 
   /* ----- Расхождения ----- */
@@ -1457,6 +1474,21 @@
         <p class="small muted">Фиксатор, пустые флаконы и прочее. Себестоимость = своя закупочная стоимость, без формулы духов.</p>
         ${(st.goods || []).length ? `<table><tbody>${st.goods.map((g) => `<tr><td>${esc(g.name)}</td><td class="n">${M(g.cost)}</td><td class="small muted">${g.updated ? C.dmy(g.updated) : ''}</td><td class="right"><button class="btn sm" data-act="goodEdit" data-id="${g.id}">Изменить</button></td></tr>`).join('')}</tbody></table>` : '<p class="empty">Пока нет.</p>'}
       </section>
+      <section class="card" id="fixedCard"><h2>Постоянные расходы в месяц</h2>
+        <p class="small muted">Аренда и другие обязательные платежи. Делятся на дни месяца: так видно, в плюсе ли каждый день, и сколько нужно продавать. Оплату аренды вносите как обычно, расходом «Аренда»: второй раз она не вычтется.</p>
+        <form id="fixedForm" autocomplete="off"><div id="fixedRows">${(st.fixed || []).map((f) => fixedRow(f)).join('') || fixedRow({ category: 'Аренда', amount: '' })}</div>
+          <div class="row wrap"><button type="button" class="btn sm" data-act="addFixed">+ Ещё расход</button><button class="btn sm primary">Сохранить</button></div></form>
+        ${C.fixedMonthly(st) ? `<p class="small">Итого ${M(C.fixedMonthly(st))} в месяц, ${M(C.fixedDaily(st, today()))} в день в этом месяце.</p>` : ''}
+      </section>
+      <section class="card"><h2>Склад: когда предупреждать</h2>
+        <form id="alertsForm" class="grid4" autocomplete="off" style="align-items:end">
+          <label>Масло меньше, мл<input name="oilMl" inputmode="decimal" value="${esc((st.stockAlerts || C.DEFAULT_ALERTS).oilMl)}"></label>
+          <label>Основа меньше, мл<input name="baseMl" inputmode="decimal" value="${esc((st.stockAlerts || C.DEFAULT_ALERTS).baseMl)}"></label>
+          <label>Флаконов меньше, шт<input name="bottles" inputmode="decimal" value="${esc((st.stockAlerts || C.DEFAULT_ALERTS).bottles)}"></label>
+          <label>Товара меньше, шт<input name="goods" inputmode="decimal" value="${esc((st.stockAlerts || C.DEFAULT_ALERTS).goods)}"></label>
+          <div><button class="btn sm primary">Сохранить</button></div>
+        </form>
+      </section>
       <section class="card"><h2>Руководитель</h2>
         <p class="small muted">Если вы сами работаете в смене, ваши продажи будут считаться отдельно под этим именем, без зарплаты.</p>
         <form id="ownerNameForm" class="row wrap" autocomplete="off"><input name="ownerName" value="${esc(st.ownerName || '')}" placeholder="Ваше имя" style="max-width:240px"><button class="btn sm primary">Сохранить</button></form>
@@ -1485,6 +1517,11 @@
         <div class="row wrap"><button class="btn sm" data-act="export">Скачать резервную копию (JSON)</button>${S.health && S.health.auth ? '<button class="btn sm danger" data-act="logout">Выйти</button>' : ''}</div>
         <p class="hint">Хранилище: ${S.health ? esc(S.health.store) : '—'}. Резервную копию полезно скачивать раз в неделю.</p>
       </section>`;
+  }
+
+  function fixedRow(f) {
+    return `<div class="grid3 fixed-row" style="align-items:end"><label>Расход<select name="cat">${C.OP_KINDS.business.cats.map((c) => `<option ${c === f.category ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
+      <label>Сумма в месяц, ₸<input name="amount" inputmode="decimal" value="${esc(fmtNum(f.amount))}"></label><div><button type="button" class="btn sm danger" data-act="rmFixed">Убрать</button></div></div>`;
   }
 
   async function addOils(rows, { confirmChanges = true } = {}) {
@@ -1818,7 +1855,7 @@
       }
       const R = C.rangeTotals(days);
       const row = (l, v, b) => `<tr class="${b ? 'total' : ''}"><td>${esc(l)}</td><td class="n">${M(v)}</td></tr>`;
-      out.innerHTML = `<h3 style="margin:4px 0 10px">Месяц: ${C.dmy(from)} – ${C.dmy(to)}</h3>
+      out.innerHTML = `${breakevenCard(days, from, to)}<h3 style="margin:4px 0 10px">Месяц: ${C.dmy(from)} – ${C.dmy(to)}</h3>
         <div class="kpis">${kpi('Выручка', M(R.revenue), 'hl')}${kpi('Валовая прибыль', M(R.gross))}${kpi('Чистый результат', M(R.result), 'hl')}${kpi('Средний чек', M(R.avgCheck))}
           ${kpi('Kaspi Pay', M(R.pay.kaspi))}${kpi('Переводы', M(R.pay.transfer))}${kpi('Наличные', M(R.pay.cash))}${kpi('Чеков / подарков', `${R.receipts} / ${R.gifts}`)}</div>
         <section class="card"><h3>Финансовый результат</h3><table><tbody>
@@ -1839,6 +1876,26 @@
       const out = $('#cabOut');
       if (out) out.innerHTML = `<section class="card"><div class="note bad">${esc(err.message)}</div></section>`;
     }
+  }
+
+  /** Карточка «Безубыточность»: сколько закрыто постоянных расходов и сколько нужно продавать. */
+  function breakevenCard(days, from, to) {
+    const monthly = C.fixedMonthly(S.settings);
+    if (!monthly) {
+      return '<section class="card"><h3>Безубыточность</h3><p class="small">Укажите аренду и другие постоянные расходы в месяц, и здесь появится: в плюсе ли каждый день, сколько уже закрыто и сколько нужно продавать в день.</p><button class="btn sm primary" data-act="goFixed">Указать аренду</button></section>';
+    }
+    const be = C.breakeven(days, S.settings, from, to, today());
+    const mo = be.month;
+    const td = days.find((d) => d.date === today());
+    const tn = td ? C.dayNet(td, S.settings) : null;
+    const pct = mo && mo.pct !== null ? mo.pct : 0;
+    return `<section class="card"><h3>Безубыточность месяца</h3>
+      <div class="row between wrap small"><span>Постоянные расходы: <b>${M(monthly)}</b> в месяц (${M(C.fixedDaily(S.settings, today()))} в день)</span>${tn ? `<span class="badge ${tn.net >= 0 ? 'ok' : 'bad'}">Сегодня ${tn.net >= 0 ? 'в плюсе' : 'убыток'}: ${M(tn.net)}</span>` : ''}</div>
+      <div class="be-bar" title="Покрыто ${Math.round(pct)}%"><div style="width:${pct}%"></div></div>
+      <p class="small">${mo.remaining ? `Закрыто ${M(mo.covered)} из ${M(monthly)} (${Math.round(pct)}%), осталось <b>${M(mo.remaining)}</b> за ${mo.daysLeft} дн.` : `Постоянные расходы месяца закрыты${mo.operating > monthly ? `, сверху заработано <b>${M(mo.operating - monthly)}</b>` : ''}. Дальше чистая прибыль.`}</p>
+      ${mo.remaining && mo.needPerDay !== null ? `<div class="note ${be.avgRevenue >= mo.needPerDay ? 'ok' : 'warn'} small">Чтобы закончить месяц без минуса, нужно в среднем <b>${M(mo.needPerDay)}</b> выручки в день${be.avgCheck ? ` (около ${Math.ceil(mo.needPerDay / be.avgCheck)} чеков)` : ''}. Сейчас в среднем ${M(be.avgRevenue)} за смену.</div>` : ''}
+      ${be.needPerShift !== null ? `<p class="hint">Точка безубыточности: ${M(be.needPerShift)} выручки за смену при текущей марже ${Math.round(be.margin * 100)}% и зарплатах.</p>` : ''}
+    </section>`;
   }
 
   async function fillAllPending() {
@@ -1887,7 +1944,14 @@
         out.innerHTML = '<section class="card"><p class="empty">За этот период смен нет. Выберите другой период.</p></section>';
         return;
       }
-      window.Dash.mount(out, { days, prev: prev.length ? prev : null, from, to });
+      let stock = null;
+      try {
+        stock = await window.Sklad.ensure();
+      } catch (e) {
+        stock = null;
+      }
+      if (!$('#dashOut') || S.tab !== 'dash') return;
+      window.Dash.mount(out, { days, prev: prev.length ? prev : null, from, to, settings: S.settings, stock, today: today() });
     } catch (err) {
       const out = $('#dashOut');
       if (out) out.innerHTML = `<section class="card"><div class="note bad">${esc(err.message)}</div></section>`;
@@ -2153,9 +2217,9 @@
     editOpening: openOpening,
     openClosing,
     showDayReport: () => {
-      modal('Предварительный отчёт', `<div class="row wrap" style="margin-bottom:10px"><button class="btn sm primary" data-act="copyDay">Скопировать</button></div><div class="report">${esc(C.dailyReportText(S.day))}</div>`, true);
+      modal('Предварительный отчёт', `<div class="row wrap" style="margin-bottom:10px"><button class="btn sm primary" data-act="copyDay">Скопировать</button></div><div class="report">${esc(C.dailyReportText(S.day, isOwner() ? S.settings : null))}</div>`, true);
     },
-    copyDay: () => copyText(C.dailyReportText(S.day)),
+    copyDay: () => copyText(C.dailyReportText(S.day, isOwner() ? S.settings : null)),
     copyReport: () => copyText($('#reportText').textContent),
     viewPhoto: (b) => viewPhoto(b.dataset.date || S.date),
     reopen: async () => {
@@ -2223,6 +2287,25 @@
       render();
     },
     dashCustom: openDashCustom,
+    tabStock: () => {
+      S.tab = 'stock';
+      LS.set('am_tab', 'stock');
+      render();
+      window.scrollTo({ top: 0 });
+    },
+    addFixed: () => $('#fixedRows').insertAdjacentHTML('beforeend', fixedRow({ category: 'Аренда', amount: '' })),
+    rmFixed: (b) => b.closest('.fixed-row').remove(),
+    goFixed: () => {
+      S.tab = 'ref';
+      render();
+      setTimeout(() => $('#fixedCard') && $('#fixedCard').scrollIntoView({ block: 'start' }), 50);
+    },
+    xlsRange: () => window.Sklad.exportRange(S.rep.lastDays || [], S.rep.from, S.rep.to),
+    xlsDay: async (b) => {
+      const d = b.dataset.date;
+      const day = d === S.date && S.day ? S.day : (await api('GET', `/api/day/${d}`)).value;
+      if (day) await window.Sklad.exportRange([day], d, d);
+    },
     openDash: () => {
       S.tab = 'dash';
       LS.set('am_tab', 'dash');
@@ -2306,6 +2389,31 @@
         .catch(fail);
       return;
     }
+    if (e.target.id === 'fixedForm') {
+      e.preventDefault();
+      const rows = $$('.fixed-row', e.target).map((r) => ({ category: $('[name=cat]', r).value, amount: C.num($('[name=amount]', r).value) })).filter((f) => f.amount > 0);
+      const cats = rows.map((r) => r.category);
+      if (new Set(cats).size !== cats.length) return toast('Каждый расход укажите один раз', true);
+      const before = C.fixedMonthly(S.settings);
+      const after = C.r2(rows.reduce((a, r) => a + r.amount, 0));
+      if (before !== after && !confirm(`Постоянные расходы: ${M(before)} → ${M(after)} в месяц. Сохранить?`)) return;
+      saveSettings((st) => {
+        st.fixed = rows;
+        st.changeLog = (st.changeLog || []).concat({ date: today(), text: `Постоянные расходы: ${rows.map((r) => `${r.category} ${r.amount}`).join(', ') || 'нет'}` });
+      }).then(() => {
+        render();
+        toast('Сохранено');
+      }).catch(fail);
+      return;
+    }
+    if (e.target.id === 'alertsForm') {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      saveSettings((st) => {
+        st.stockAlerts = { oilMl: C.num(fd.get('oilMl')), baseMl: C.num(fd.get('baseMl')), bottles: C.num(fd.get('bottles')), goods: C.num(fd.get('goods')) };
+      }).then(() => toast('Сохранено')).catch(fail);
+      return;
+    }
     if (e.target.id === 'ownerNameForm') {
       e.preventDefault();
       const name = e.target.ownerName.value.trim();
@@ -2366,6 +2474,20 @@
       $('#loginErr').textContent = err.message;
     }
   });
+
+  window.AM = {
+    S,
+    api,
+    modal,
+    closeModal,
+    toast,
+    fail,
+    render: () => render(),
+    saveSettings: (m) => saveSettings(m),
+    today,
+    uid,
+    loadDay: () => loadDay(),
+  };
 
   async function whoAmI() {
     const me = await api('POST', '/api/login');

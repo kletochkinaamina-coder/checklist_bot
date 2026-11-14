@@ -100,6 +100,7 @@ function settingsForSeller(s) {
       s.ownerName && !(s.sellers || []).some((x) => Calc.norm(x.name) === Calc.norm(s.ownerName)) ? [{ name: s.ownerName, owner: true }] : [],
     ),
     ownerName: s.ownerName || '',
+    fixed: [],
     changeLog: [],
   };
 }
@@ -148,7 +149,106 @@ function cleanSettings(v) {
   s.sellers = (s.sellers || []).filter((x) => x && !Calc.blank(x.name)).map((x) => ({ name: String(x.name).trim(), salary: Calc.num(x.salary) }));
   s.changeLog = Array.isArray(s.changeLog) ? s.changeLog.slice(-200) : [];
   s.ownerName = String(s.ownerName || '').trim();
+  const bizCats = Calc.OP_KINDS.business.cats;
+  s.fixed = (Array.isArray(s.fixed) ? s.fixed : [])
+    .filter((f) => f && bizCats.includes(f.category) && Calc.num(f.amount) > 0)
+    .map((f) => ({ category: f.category, amount: Calc.num(f.amount) }));
+  const al = Object.assign({}, Calc.DEFAULT_ALERTS, s.stockAlerts || {});
+  s.stockAlerts = Object.fromEntries(Object.entries(Calc.DEFAULT_ALERTS).map(([k]) => [k, Math.max(0, Calc.num(al[k]))]));
   return s;
+}
+
+const STOCK_KINDS = new Set(['oil', 'base', 'bottle', 'good']);
+const PURCHASE_CAT = { oil: 'Масла', base: 'Основа и фиксатор', bottle: 'Флаконы', good: 'Другой товар' };
+
+function stockKey(kind, l) {
+  if (kind === 'base') return 'base';
+  if (kind === 'bottle') {
+    const t = l.bottleType === 'oil' ? 'oil' : 'perfume';
+    const v = Calc.num(l.volume);
+    if (!(v > 0)) throw new HttpError(400, 'Укажите объём флакона');
+    return `${t}:${v}`;
+  }
+  if (Calc.blank(l.name)) throw new HttpError(400, 'Укажите название');
+  return Calc.norm(l.name);
+}
+function stockName(kind, key, l) {
+  if (kind === 'base') return Calc.BASE_NAME;
+  if (kind === 'bottle') return Calc.bottleName(key);
+  return String(l.name).trim();
+}
+
+/** Приход и ревизия склада. Документ склада пишется через compare-and-set. */
+async function mutateStock(store, body) {
+  const t = new Date().toISOString();
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const cur = await store.get(K.stock);
+    const doc = cur ? JSON.parse(JSON.stringify(cur.value)) : { receipts: [], revisions: [] };
+    doc.receipts = doc.receipts || [];
+    doc.revisions = doc.revisions || [];
+    if (body.type === 'receipt') {
+      if (!DATE_RE.test(body.date || '')) throw new HttpError(400, 'Неверная дата прихода');
+      const lines = Array.isArray(body.lines) ? body.lines : [];
+      if (!lines.length) throw new HttpError(400, 'Добавьте хотя бы одну позицию');
+      const batch = crypto.randomBytes(5).toString('hex');
+      for (const l of lines) {
+        if (!STOCK_KINDS.has(l.kind)) throw new HttpError(400, 'Неверный вид позиции');
+        const qty = Calc.num(l.qty);
+        if (!(qty > 0)) throw new HttpError(400, 'Количество должно быть больше нуля');
+        const sum = Calc.num(l.sum);
+        if (sum < 0) throw new HttpError(400, 'Сумма не может быть отрицательной');
+        const key = stockKey(l.kind, l);
+        doc.receipts.push({ id: crypto.randomBytes(5).toString('hex'), batch, date: body.date, at: t, kind: l.kind, key, name: stockName(l.kind, key, l), qty, sum, note: String(body.note || '') });
+      }
+    } else if (body.type === 'removeReceipt') {
+      const before = doc.receipts.length;
+      doc.receipts = doc.receipts.filter((r) => r.batch !== body.batch);
+      if (doc.receipts.length === before) throw new HttpError(404, 'Приход не найден');
+    } else if (body.type === 'revision') {
+      if (!DATE_RE.test(body.date || '')) throw new HttpError(400, 'Неверная дата ревизии');
+      const items = (Array.isArray(body.items) ? body.items : []).filter((r) => r && !Calc.blank(r.counted));
+      if (!items.length) throw new HttpError(400, 'Внесите фактическое количество хотя бы по одной позиции');
+      doc.revisions.push({
+        id: crypto.randomBytes(5).toString('hex'),
+        date: body.date,
+        at: t,
+        note: String(body.note || ''),
+        items: items.map((r) => {
+          if (!STOCK_KINDS.has(r.kind) || Calc.blank(r.key)) throw new HttpError(400, 'Неверная позиция ревизии');
+          if (Calc.num(r.counted) < 0) throw new HttpError(400, 'Количество не может быть отрицательным');
+          return { kind: r.kind, key: String(r.key), name: String(r.name || r.key), counted: Calc.num(r.counted), expected: Calc.num(r.expected), unitCost: r.unitCost === null || r.unitCost === undefined ? null : Calc.num(r.unitCost) };
+        }),
+      });
+    } else if (body.type === 'removeRevision') {
+      const before = doc.revisions.length;
+      doc.revisions = doc.revisions.filter((r) => r.id !== body.id);
+      if (doc.revisions.length === before) throw new HttpError(404, 'Ревизия не найдена');
+    } else {
+      throw new HttpError(400, 'Неизвестное действие склада');
+    }
+    const rev = cur ? cur.rev : 0;
+    if (await store.cas(K.stock, rev, doc)) return { rev: rev + 1, value: doc };
+  }
+  throw new HttpError(409, 'Склад одновременно меняли с другого устройства. Повторите.');
+}
+
+/** Оплата закупа: расход «Закупка товара» в смену этой даты, если она открыта. */
+async function recordPurchasePayment(store, body, role) {
+  const cur = await store.get(K.day(body.date));
+  if (!cur || cur.value.status !== 'open') {
+    return `Смена ${body.date.split('-').reverse().join('.')} не открыта: оплату закупа внесите вручную в операциях смены.`;
+  }
+  const groups = {};
+  for (const l of body.lines || []) {
+    const sum = Calc.num(l.sum);
+    if (!(sum > 0)) continue;
+    const cat = PURCHASE_CAT[l.kind] || 'Другой товар';
+    groups[cat] = (groups[cat] || 0) + sum;
+  }
+  for (const [category, amount] of Object.entries(groups)) {
+    await mutateDay(store, body.date, { type: 'upsertOp', op: { kind: 'purchase', category, amount, account: body.payFrom, note: `Приход на склад${body.note ? `: ${body.note}` : ''}` } }, { role });
+  }
+  return Object.keys(groups).length ? 'Оплата закупа записана в операции смены.' : '';
 }
 
 function seedOils() {
@@ -291,6 +391,34 @@ async function handle(req, res) {
         days += 1;
       }
       return send(res, 200, { ok: true, days });
+    }
+
+    if (p === '/api/stock') {
+      ownerOnly(role);
+      if (m === 'GET') {
+        const cur = await store.get(K.stock);
+        // Расход за дни, сохранённые до появления склада, досчитываем один раз
+        const [idx, cons] = await Promise.all([store.hgetall(K.index), store.hgetall(K.cons)]);
+        const missing = Object.keys(idx).filter((d) => !cons[d]);
+        if (missing.length) {
+          const docs = await store.mget(missing.map(K.day));
+          for (let i = 0; i < missing.length; i++) {
+            if (!docs[i]) continue;
+            cons[missing[i]] = Calc.dayConsumption(docs[i].value);
+            await store.hset(K.cons, missing[i], cons[missing[i]]);
+          }
+        }
+        return send(res, 200, { rev: cur ? cur.rev : 0, value: cur ? cur.value : { receipts: [], revisions: [] }, cons });
+      }
+      if (m === 'POST') {
+        const body = await readBody(req);
+        const r = await mutateStock(store, body);
+        let payNote = '';
+        if (body.type === 'receipt' && body.payFrom && Calc.ACCOUNTS.includes(body.payFrom)) {
+          payNote = await recordPurchasePayment(store, body, role);
+        }
+        return send(res, 200, { ...r, payNote });
+      }
     }
 
     if (p === '/api/export' && m === 'GET') {
