@@ -43,6 +43,8 @@
       <p>Введите PIN для входа</p>
       <p class="small muted">PIN руководителя открывает кабинет, PIN продавцов открывает смену магазина.</p>
       <input id="pinInput" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN" required>
+      <label class="check" style="justify-content:center"><input type="checkbox" id="rememberIn"> Запомнить на этом устройстве</label>
+      <p class="hint">На общем телефоне магазина не ставьте галочку при входе руководителя: вход сбросится после 15 минут без действий.</p>
       <p class="err" id="loginErr"></p>
       <button class="btn primary big">Войти</button>
     </form>
@@ -51,6 +53,7 @@
   <datalist id="goodsList"></datalist>
   <datalist id="sellerNames"></datalist>
   <script src="calc.js"></script>
+  <script src="seed.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

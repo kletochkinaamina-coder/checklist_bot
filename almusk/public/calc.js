@@ -77,6 +77,7 @@
   }
 
   const norm = (s) => String(s || '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
+  const hasPrice = (o) => !!o && num(o.price) > 0;
   const findOil = (settings, name) => (settings.oils || []).find((o) => norm(o.name) === norm(name)) || null;
   const findGood = (settings, name) => (settings.goods || []).find((g) => norm(g.name) === norm(name)) || null;
   const tableValue = (table, vol) => {
@@ -723,6 +724,12 @@
     for (const raw of String(text || '').split(/\r?\n/)) {
       const line = raw.trim();
       if (!line) continue;
+      // «Название ?» или «Название» без цены: аромат без закупочной цены
+      const q = line.match(/^(.*?)[\s;:\t—–=|-]*\?+\s*$/);
+      if (q && q[1].trim()) {
+        rows.push({ name: q[1].trim(), price: null });
+        continue;
+      }
       const m = line.match(/^(.*?)[\s;:\t—–=|-]*([0-9]+(?:[.,][0-9]+)?)\s*(?:₸|тг|тенге|kzt)?\.?\s*(?:за\s*1?\s*мл|\/\s*мл)?\s*$/i);
       if (!m || !m[1].trim()) {
         bad.push(line);
@@ -749,6 +756,7 @@
     DEFAULT_SETTINGS,
     withDefaults,
     findOil,
+    hasPrice,
     findGood,
     tableValue,
     itemCalc,

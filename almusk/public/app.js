@@ -33,11 +33,23 @@
       try { localStorage.removeItem(k); } catch (e) { /* приватный режим */ }
     },
   };
+  const SS = {
+    get(k) {
+      try { return sessionStorage.getItem(k); } catch (e) { return null; }
+    },
+    set(k, v) {
+      try { sessionStorage.setItem(k, v); } catch (e) { /* приватный режим */ }
+    },
+    del(k) {
+      try { sessionStorage.removeItem(k); } catch (e) { /* приватный режим */ }
+    },
+  };
   const val = (v) => (v === undefined || v === null ? '' : v);
   const fmtNum = (v) => (C.blank(v) ? '' : String(v));
 
   const S = {
-    pin: LS.get('am_pin') || '',
+    pin: LS.get('am_pin') || SS.get('am_pin') || '',
+    remembered: !!LS.get('am_pin'),
     role: 'owner',
     sellerPinSet: false,
     health: null,
@@ -224,7 +236,7 @@
     $('#tabs').hidden = !owner;
     $('#dateBar').hidden = !owner;
     $('#roleBox').innerHTML = owner
-      ? (S.health && S.health.auth ? '<span class="badge">Руководитель</span>' : '')
+      ? (S.health && S.health.auth ? '<span class="badge">Руководитель</span><button class="chip" data-act="logout">Выйти</button>' : '')
       : '<span class="badge">Продавец</span><button class="chip" data-act="logout">Выйти</button>';
     $('#dateInput').value = S.date;
     $('#todayBtn').hidden = S.date === today();
@@ -282,7 +294,8 @@
         <label style="max-width:200px">Время начала смены<input name="time" type="time" value="${nowTime()}" required></label>
         <h3>Продавцы смены</h3>
         <div id="openSellers">${sellerRowHtml({ start: nowTime() })}</div>
-        <button type="button" class="btn ghost sm" data-act="addOpenSeller">+ Ещё продавец</button>
+        <div class="row wrap"><button type="button" class="btn ghost sm" data-act="addOpenSeller">+ Ещё продавец</button><button type="button" class="btn ghost sm" data-act="ownerOnShiftOpen">+ Я на смене</button></div>
+        <p class="hint">Зарплата обязательна. Для руководителя ставится 0.</p>
         <h3>Начальные остатки</h3>
         ${prevHtml}
         <div class="grid3">
@@ -418,7 +431,7 @@
         ${open ? '<button class="btn ghost sm" data-act="editOpening">Изменить начальные остатки</button>' : ''}
         <h3 style="margin-top:14px">Продавцы</h3>
         ${sellersBlock(d, t, open)}
-        ${open ? '<button class="btn ghost sm" data-act="editSellers" style="margin-top:6px">Продавцы и зарплаты</button>' : ''}
+        ${open ? `<div class="row wrap" style="margin-top:6px"><button class="btn ghost sm" data-act="editSellers">Продавцы и зарплаты</button>${(d.sellers || []).some((x) => S.settings.ownerName && C.norm(x.name) === C.norm(S.settings.ownerName)) ? '' : '<button class="btn ghost sm" data-act="ownerOnShift">+ Я на смене</button>'}</div>` : ''}
       </section>
       <div class="kpis">
         ${kpi('Выручка', M(t.revenue), 'hl')}
@@ -541,7 +554,7 @@
       }
     } else {
       const o = C.findOil(S.settings, it.name);
-      if (o) {
+      if (C.hasPrice(o)) {
         it.src = 'ref';
         it.oilPrice = o.price;
       } else if (it.src !== 'manual') {
@@ -562,7 +575,7 @@
     const o = C.findOil(S.settings, it.name);
     const ro = it.src === 'ref' || it.src === 'snap';
     return `<label>Закупка масла за 1 мл, ₸<input data-f="oilPrice" inputmode="decimal" value="${esc(fmtNum(it.oilPrice))}" ${ro ? 'readonly' : ''} class="${!ro && !C.blank(it.name) && !(C.num(it.oilPrice) > 0) ? 'req' : ''}"></label>
-      <div class="hint ${it.src === 'manual' && !C.blank(it.name) ? 'bad' : ''}">${it.src === 'ref' ? `из справочника${o && o.updated ? `, обновлено ${C.dmy(o.updated)}` : ''}` : it.src === 'snap' ? 'цена на момент продажи' : C.blank(it.name) ? 'Выберите аромат из списка' : 'Аромата нет в справочнике. Укажите закупочную цену за 1 мл.'}</div>
+      <div class="hint ${it.src === 'manual' && !C.blank(it.name) ? 'bad' : ''}">${it.src === 'ref' ? `из справочника${o && o.updated ? `, обновлено ${C.dmy(o.updated)}` : ''}` : it.src === 'snap' ? 'цена на момент продажи' : C.blank(it.name) ? 'Выберите аромат из списка' : o ? 'В справочнике нет цены. Укажите закупочную цену за 1 мл.' : 'Аромата нет в справочнике. Укажите закупочную цену за 1 мл.'}</div>
       ${it.src === 'manual' && !C.blank(it.name) ? `<label class="check"><input type="checkbox" data-f="saveRef" ${it.saveRef ? 'checked' : ''}> Добавить в справочник</label>` : ''}`;
   }
 
@@ -632,7 +645,10 @@
       : {
           id: uid(),
           time: nowTime(),
-          seller: names.length === 1 ? names[0] : names.includes(lastSeller) ? lastSeller : '',
+          // Руководитель в смене: по умолчанию продажа записывается на него
+          seller: isOwner() && S.settings.ownerName && names.includes(S.settings.ownerName)
+            ? S.settings.ownerName
+            : names.length === 1 ? names[0] : names.includes(lastSeller) ? lastSeller : '',
           promo: '',
           note: '',
           pay: { kaspi: '', transfer: '', cash: '' },
@@ -820,7 +836,7 @@
       btn.disabled = true;
       try {
         const canRef = isOwner();
-        const newOils = draft.items.filter((it) => canRef && it.type !== 'other' && it.src === 'manual' && it.saveRef && !C.costMissing(it).length && !C.findOil(S.settings, it.name));
+        const newOils = draft.items.filter((it) => canRef && it.type !== 'other' && it.src === 'manual' && it.saveRef && !C.costMissing(it).length && !C.hasPrice(C.findOil(S.settings, it.name)));
         const newGoods = draft.items.filter((it) => canRef && it.type === 'other' && it.src === 'manual' && it.saveRef && !C.costMissing(it).length && !C.findGood(S.settings, it.name));
         if (newOils.length || newGoods.length) {
           const d = today();
@@ -829,7 +845,15 @@
             for (const it of newOils) {
               if (seen.has(C.norm(it.name))) continue;
               seen.add(C.norm(it.name));
-              st.oils.push({ id: uid(), name: it.name.trim(), price: C.num(it.oilPrice), updated: d, history: [{ date: d, price: C.num(it.oilPrice) }] });
+              const ex = st.oils.find((o) => C.norm(o.name) === C.norm(it.name));
+              if (ex) {
+                // В справочнике был без цены: записываем цену
+                ex.price = C.num(it.oilPrice);
+                ex.updated = d;
+                ex.history = (ex.history || []).concat({ date: d, price: ex.price });
+              } else {
+                st.oils.push({ id: uid(), name: it.name.trim(), price: C.num(it.oilPrice), updated: d, history: [{ date: d, price: C.num(it.oilPrice) }] });
+              }
             }
             for (const it of newGoods) {
               if (seen.has(`g:${C.norm(it.name)}`)) continue;
@@ -1411,15 +1435,27 @@
     const q = C.norm(S.refSearch);
     const oils = (st.oils || []).filter((o) => !q || C.norm(o.name).includes(q)).sort((a, b) => a.name.localeCompare(b.name, 'ru'));
     const tableRows = (tbl, unit) => Object.entries(tbl || {}).sort((a, b) => Number(a[0]) - Number(b[0])).map(([k, v]) => `<tr><td>${String(k).replace('.', ',')} мл</td><td class="n">${unit === '%' ? `${v}%` : M(v)}</td></tr>`).join('');
+    const noPrice = (st.oils || []).filter((o) => !C.hasPrice(o));
+    const seedMissing = window.SEED ? C.parsePriceList(window.SEED.TEXT).rows.filter((r) => !C.findOil(st, r.name)).length : 0;
     return `<section class="card">
-        <div class="row between wrap"><h2>Ароматы (${(st.oils || []).length})</h2><div class="row wrap"><button class="btn sm primary" data-act="oilAdd">+ Аромат</button><button class="btn sm" data-act="oilImport">Импорт списком</button></div></div>
-        <p class="small muted">Закупочная цена за 1 мл концентрированного масла. Изменение цены сохраняется с датой. Прошлые продажи не пересчитываются.</p>
+        <div class="row between wrap"><h2>Ароматы (${(st.oils || []).length})</h2><div class="row wrap"><button class="btn sm" data-act="oilImport">Добавить списком</button>${seedMissing ? `<button class="btn sm gold" data-act="oilSeed">Стартовый список Al Musk (${seedMissing})</button>` : ''}</div></div>
+        <p class="small muted">Закупочная цена за 1 мл концентрированного масла. Нажмите на цену, чтобы изменить её.</p>
+        <form id="quickOil" class="grid3" autocomplete="off" style="align-items:end">
+          <label>Новый аромат<input name="name" placeholder="Название"></label>
+          <label>Цена за 1 мл, ₸<input name="price" inputmode="decimal" placeholder="пусто, если неизвестна"></label>
+          <div><button class="btn primary" style="width:100%">+ Добавить</button></div>
+        </form>
+        ${noPrice.length ? `<div class="note warn small">Без цены: ${noPrice.map((o) => `<button class="link" data-act="oilEdit" data-id="${o.id}">${esc(o.name)}</button>`).join(', ')}. Продажи этих ароматов будут ждать себестоимости.</div>` : ''}
         <input class="search" id="refSearch" placeholder="Поиск аромата" value="${esc(S.refSearch)}">
-        ${oils.length ? `<div class="tbl-wrap"><table><thead><tr><th>Аромат</th><th class="n">Цена за 1 мл</th><th>Обновлено</th><th></th></tr></thead><tbody>${oils.map((o) => `<tr><td>${esc(o.name)}</td><td class="n">${M(o.price)}</td><td class="small muted">${o.updated ? C.dmy(o.updated) : ''}</td><td class="right"><button class="btn sm" data-act="oilEdit" data-id="${o.id}">Изменить</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="note warn">${(st.oils || []).length ? 'Ничего не найдено.' : 'Справочник пуст. Добавьте ароматы или вставьте весь список через «Импорт списком».'}</div>`}
+        ${oils.length ? `<div class="tbl-wrap"><table><thead><tr><th>Аромат</th><th class="n">Цена за 1 мл</th><th>Обновлено</th></tr></thead><tbody>${oils.map((o) => `<tr><td><button class="link" data-act="oilEdit" data-id="${o.id}" style="color:inherit;text-decoration:none;text-align:left">${esc(o.name)}</button></td><td class="n"><button class="btn sm" data-act="oilEdit" data-id="${o.id}">${C.hasPrice(o) ? M(o.price) : '<span class="badge warn">нет цены</span>'}</button></td><td class="small muted">${o.updated ? C.dmy(o.updated) : ''}</td></tr>`).join('')}</tbody></table></div>` : `<div class="note warn">${(st.oils || []).length ? 'Ничего не найдено.' : 'Справочник пуст. Добавьте ароматы выше или списком.'}</div>`}
       </section>
       <section class="card"><div class="row between wrap"><h2>Другие товары</h2><button class="btn sm primary" data-act="goodAdd">+ Товар</button></div>
         <p class="small muted">Фиксатор, пустые флаконы и прочее. Себестоимость = своя закупочная стоимость, без формулы духов.</p>
         ${(st.goods || []).length ? `<table><tbody>${st.goods.map((g) => `<tr><td>${esc(g.name)}</td><td class="n">${M(g.cost)}</td><td class="small muted">${g.updated ? C.dmy(g.updated) : ''}</td><td class="right"><button class="btn sm" data-act="goodEdit" data-id="${g.id}">Изменить</button></td></tr>`).join('')}</tbody></table>` : '<p class="empty">Пока нет.</p>'}
+      </section>
+      <section class="card"><h2>Руководитель</h2>
+        <p class="small muted">Если вы сами работаете в смене, ваши продажи будут считаться отдельно под этим именем, без зарплаты.</p>
+        <form id="ownerNameForm" class="row wrap" autocomplete="off"><input name="ownerName" value="${esc(st.ownerName || '')}" placeholder="Ваше имя" style="max-width:240px"><button class="btn sm primary">Сохранить</button></form>
       </section>
       <section class="card"><div class="row between wrap"><h2>Продавцы</h2><button class="btn sm" data-act="sellersRef">Изменить</button></div>
         ${(st.sellers || []).length ? `<table><tbody>${st.sellers.map((s) => `<tr><td>${esc(s.name)}</td><td class="n">${M(s.salary)} за смену</td></tr>`).join('')}</tbody></table>` : '<p class="empty">Добавятся автоматически при открытии смены.</p>'}
@@ -1447,16 +1483,58 @@
       </section>`;
   }
 
+  async function addOils(rows, { confirmChanges = true } = {}) {
+    const d = today();
+    const changed = rows.filter((r) => {
+      const ex = C.findOil(S.settings, r.name);
+      return ex && r.price !== null && ex.price !== r.price;
+    });
+    if (confirmChanges && changed.length && !confirm(`У ${changed.length} ароматов изменится цена:\n${changed.slice(0, 10).map((r) => `${r.name}: ${M(C.findOil(S.settings, r.name).price)} → ${M(r.price)}`).join('\n')}\n\nПодтверждаете?`)) return null;
+    let added = 0;
+    await saveSettings((st) => {
+      for (const r of rows) {
+        const ex = st.oils.find((o) => C.norm(o.name) === C.norm(r.name));
+        if (ex) {
+          if (r.price !== null && ex.price !== r.price) {
+            ex.history = (ex.history || []).concat({ date: d, price: r.price });
+            ex.updated = d;
+            ex.price = r.price;
+          }
+        } else {
+          st.oils.push({ id: uid(), name: r.name, price: r.price, updated: d, history: r.price ? [{ date: d, price: r.price }] : [] });
+          added += 1;
+        }
+      }
+    });
+    return { added, changed: changed.length };
+  }
+
   function openOilEdit(id, isGood) {
     const listKey = isGood ? 'goods' : 'oils';
     const priceKey = isGood ? 'cost' : 'price';
     const cur = (S.settings[listKey] || []).find((o) => o.id === id);
-    const body = modal(cur ? `Изменить: ${cur.name}` : isGood ? 'Новый товар' : 'Новый аромат', `<form autocomplete="off">
+    const lastDate = cur && (cur.history || []).length ? cur.history[cur.history.length - 1].date : (cur && cur.updated) || today();
+    const body = modal(cur ? cur.name : isGood ? 'Новый товар' : 'Новый аромат', `<form autocomplete="off">
       <label>${isGood ? 'Название товара' : 'Название аромата'}<input name="name" value="${esc(cur ? cur.name : '')}" required></label>
-      <label>${isGood ? 'Закупочная стоимость за 1 шт., ₸' : 'Закупочная цена за 1 мл масла, ₸'}<input name="price" inputmode="decimal" value="${esc(cur ? fmtNum(cur[priceKey]) : '')}" required></label>
-      ${cur && (cur.history || []).length ? `<h3>История цены</h3><ul class="small muted">${cur.history.slice().reverse().map((h) => `<li>${C.dmy(h.date)}: ${M(h[priceKey])}</li>`).join('')}</ul>` : ''}
-      <p class="hint">Новая цена применяется к новым продажам. Себестоимость прошлых продаж не меняется.</p>
+      <label>${isGood ? 'Закупочная стоимость за 1 шт., ₸' : 'Закупочная цена за 1 мл масла, ₸'}<input name="price" inputmode="decimal" value="${esc(cur ? fmtNum(cur[priceKey]) : '')}" ${isGood ? 'required' : 'placeholder="пусто, если цена пока неизвестна"'}></label>
+      <div id="whyBox" hidden>
+        <h3>Почему меняется цена</h3>
+        <label class="check"><input type="radio" name="why" value="change" checked> Цена закупки изменилась: новая цена для новых продаж, прошлые не меняются</label>
+        ${isGood ? '' : `<label class="check"><input type="radio" name="why" value="fix"> Цена была указана неправильно: пересчитать себестоимость продаж</label>
+        <label id="fixFrom" hidden>Пересчитать продажи начиная с<input type="date" name="from" value="${esc(lastDate)}"></label>`}
+      </div>
+      ${cur && (cur.history || []).length ? `<h3>История цены</h3><ul class="small muted">${cur.history.slice().reverse().map((h) => `<li>${C.dmy(h.date)}: ${M(h[priceKey])}${h.fix ? ' (исправление ошибки)' : ''}</li>`).join('')}</ul>` : ''}
       <div class="sheet-f">${cur ? '<button type="button" class="btn danger" data-del>Удалить</button>' : '<button type="button" class="btn" data-act="closeModal">Отмена</button>'}<button class="btn primary">Сохранить</button></div></form>`);
+    const form = $('form', body);
+    const syncWhy = () => {
+      const v = form.price.value;
+      const changed = cur && C.hasPrice({ price: cur[priceKey] }) && !C.blank(v) && C.num(v) !== cur[priceKey];
+      $('#whyBox', form).hidden = !changed;
+      const fix = form.querySelector('[name=why]:checked');
+      if ($('#fixFrom', form)) $('#fixFrom', form).hidden = !(fix && fix.value === 'fix');
+    };
+    form.addEventListener('input', syncWhy);
+    form.addEventListener('change', syncWhy);
     body.addEventListener('click', async (e) => {
       if (!e.target.closest('[data-del]')) return;
       if (!confirm(`Удалить «${cur.name}» из справочника? Прошлые продажи не изменятся.`)) return;
@@ -1470,45 +1548,63 @@
         fail(err);
       }
     });
-    body.addEventListener('submit', async (e) => {
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const fd = new FormData(e.target);
+      const fd = new FormData(form);
       const name = String(fd.get('name')).trim();
-      const price = C.num(fd.get('price'));
-      if (!name || C.blank(fd.get('price')) || (!isGood && !(price > 0))) return toast('Укажите название и цену', true);
+      const raw = String(fd.get('price') || '').trim();
+      const price = C.blank(raw) ? null : C.num(raw);
+      if (!name) return toast('Укажите название', true);
+      if (isGood ? price === null : price !== null && !(price > 0)) return toast('Проверьте цену', true);
       const dupe = (S.settings[listKey] || []).find((o) => C.norm(o.name) === C.norm(name) && o.id !== id);
       if (dupe) return toast(`«${dupe.name}» уже есть в справочнике`, true);
-      if (cur && cur[priceKey] !== price && !confirm(`Изменить цену «${name}» с ${M(cur[priceKey])} на ${M(price)}?`)) return;
+      const why = fd.get('why') || 'change';
+      const from = fd.get('from');
+      const priceChanged = cur && cur[priceKey] !== price;
+      if (cur && cur[priceKey] && price === null && !confirm('Убрать цену? Новые продажи этого аромата будут без себестоимости.')) return;
+      if (priceChanged && price !== null && C.hasPrice({ price: cur[priceKey] })) {
+        const msg = why === 'fix'
+          ? `Исправить цену «${name}» с ${M(cur[priceKey])} на ${M(price)} и пересчитать себестоимость всех продаж с ${C.dmy(from)}?`
+          : `Цена «${name}» изменилась с ${M(cur[priceKey])} на ${M(price)}. Прошлые продажи не меняются. Сохранить?`;
+        if (!confirm(msg)) return;
+      }
       const d = today();
       try {
         await saveSettings((st) => {
           const list = st[listKey];
           const o = list.find((x) => x.id === id);
           if (o) {
-            if (o[priceKey] !== price) {
-              o.history = (o.history || []).concat({ date: d, [priceKey]: price });
+            if (o[priceKey] !== price && price !== null) {
+              o.history = (o.history || []).concat({ date: why === 'fix' ? from || d : d, [priceKey]: price, ...(why === 'fix' ? { fix: true } : {}) });
               o.updated = d;
             }
             o[priceKey] = price;
             o.name = name;
           } else {
-            list.push({ id: uid(), name, [priceKey]: price, updated: d, history: [{ date: d, [priceKey]: price }] });
+            list.push({ id: uid(), name, [priceKey]: price, updated: d, history: price !== null ? [{ date: d, [priceKey]: price }] : [] });
           }
         });
+        let msg = 'Справочник обновлён';
+        if (!isGood && price !== null && (why === 'fix' || (cur && !C.hasPrice({ price: cur[priceKey] })))) {
+          // Исправление ошибки или первая цена: пересчитываем прошлые продажи
+          const r = await api('POST', '/api/reprice', { name, price, from: why === 'fix' ? from : '2000-01-01', to: '2999-12-31' });
+          await Promise.all([loadIndex(), loadDay()]);
+          msg = r.days ? `Себестоимость пересчитана в сменах: ${r.days}` : 'Продаж этого аромата не было, пересчитывать нечего';
+        }
         closeModal();
         render();
-        toast('Справочник обновлён');
+        toast(msg);
       } catch (err) {
         fail(err);
       }
     });
   }
 
-  function openImport() {
-    const body = modal('Импорт ароматов списком', `<form>
-      <p class="small">Вставьте список: каждый аромат с новой строки, цена за 1 мл в конце строки.</p>
-      <p class="small muted">Например: «Baccarat Rouge 540 — 120» или «Black Opium; 85».</p>
-      <textarea name="text" rows="10" placeholder="Название — цена"></textarea>
+  function openImport(prefill) {
+    const body = modal('Добавить ароматы списком', `<form>
+      <p class="small">Каждый аромат с новой строки, цена за 1 мл в конце строки. Если цена неизвестна, поставьте «?».</p>
+      <p class="small muted">Например: «Creed aventus 125», «Black Opium; 85», «Chanel splandide ?»</p>
+      <textarea name="text" rows="10" placeholder="Название цена">${esc(prefill || '')}</textarea>
       <div id="impPrev"></div>
       <div class="sheet-f"><button type="button" class="btn" data-prev>Проверить</button><button class="btn primary" disabled>Загрузить</button></div></form>`, true);
     const form = $('form', body);
@@ -1517,14 +1613,17 @@
       parsed = C.parsePriceList(form.text.value);
       const rows = parsed.rows.map((r) => {
         const ex = C.findOil(S.settings, r.name);
-        const st = !ex ? '<span class="badge ok">новый</span>' : ex.price === r.price ? '<span class="badge">без изменений</span>' : `<span class="badge warn">цена ${M(ex.price)} → ${M(r.price)}</span>`;
-        return `<tr><td>${esc(r.name)}</td><td class="n">${M(r.price)}</td><td>${st}</td></tr>`;
+        const st = !ex
+          ? (r.price === null ? '<span class="badge warn">новый, без цены</span>' : '<span class="badge ok">новый</span>')
+          : r.price === null || ex.price === r.price ? '<span class="badge">уже есть</span>' : `<span class="badge warn">цена ${C.hasPrice(ex) ? M(ex.price) : 'нет'} → ${M(r.price)}</span>`;
+        return `<tr><td>${esc(r.name)}</td><td class="n">${r.price === null ? '?' : M(r.price)}</td><td>${st}</td></tr>`;
       }).join('');
       $('#impPrev', form).innerHTML = `${parsed.rows.length ? `<div class="tbl-wrap" style="max-height:300px;overflow:auto"><table><tbody>${rows}</tbody></table></div>` : ''}
         ${parsed.bad.length ? `<div class="note bad small">Не распознаны строки (${parsed.bad.length}):<ul>${parsed.bad.slice(0, 10).map((b) => `<li>${esc(b)}</li>`).join('')}</ul></div>` : ''}
         <p class="small">Распознано: ${parsed.rows.length}</p>`;
       $('button.primary', form).disabled = !parsed.rows.length;
     };
+    if (prefill) preview();
     body.addEventListener('click', (e) => {
       if (e.target.closest('[data-prev]')) preview();
     });
@@ -1535,30 +1634,12 @@
       e.preventDefault();
       preview();
       if (!parsed.rows.length) return;
-      const changed = parsed.rows.filter((r) => {
-        const ex = C.findOil(S.settings, r.name);
-        return ex && ex.price !== r.price;
-      });
-      if (changed.length && !confirm(`У ${changed.length} ароматов изменится цена. Подтверждаете?`)) return;
-      const d = today();
       try {
-        await saveSettings((st) => {
-          for (const r of parsed.rows) {
-            const ex = st.oils.find((o) => C.norm(o.name) === C.norm(r.name));
-            if (ex) {
-              if (ex.price !== r.price) {
-                ex.history = (ex.history || []).concat({ date: d, price: r.price });
-                ex.updated = d;
-                ex.price = r.price;
-              }
-            } else {
-              st.oils.push({ id: uid(), name: r.name, price: r.price, updated: d, history: [{ date: d, price: r.price }] });
-            }
-          }
-        });
+        const r = await addOils(parsed.rows);
+        if (!r) return;
         closeModal();
         render();
-        toast(`Загружено: ${parsed.rows.length}`);
+        toast(`Добавлено: ${r.added}${r.changed ? `, цен изменено: ${r.changed}` : ''}`);
       } catch (err) {
         fail(err);
       }
@@ -1908,6 +1989,17 @@
     });
   }
 
+  async function ensureOwnerName() {
+    let name = String(S.settings.ownerName || '').trim();
+    if (name) return name;
+    name = (prompt('Ваше имя для учёта продаж в смене (сохранится в справочнике):') || '').trim();
+    if (!name) return '';
+    await saveSettings((st) => {
+      st.ownerName = name;
+    });
+    return name;
+  }
+
   /* ---------- События ---------- */
 
   async function setDate(d) {
@@ -1933,6 +2025,23 @@
       LS.set('am_tab', 'shift');
       closeModal();
       setDate(b.dataset.date);
+    },
+    ownerOnShiftOpen: async () => {
+      const name = await ensureOwnerName();
+      if (!name) return;
+      const rows = $$('#openSellers .seller-in');
+      if (rows.some((r) => C.norm($('[name=sname]', r).value) === C.norm(name))) return toast('Вы уже в списке');
+      const empty = rows.find((r) => !$('[name=sname]', r).value.trim() && !$('[name=ssalary]', r).value.trim());
+      if (empty) empty.remove();
+      $('#openSellers').insertAdjacentHTML('beforeend', sellerRowHtml({ name, salary: 0, start: nowTime() }));
+    },
+    ownerOnShift: async () => {
+      const name = await ensureOwnerName();
+      if (!name) return;
+      if ((S.day.sellers || []).some((x) => C.norm(x.name) === C.norm(name))) return toast('Вы уже в смене');
+      await act({ type: 'setSellers', sellers: (S.day.sellers || []).concat({ name, salary: 0, start: nowTime() }) });
+      render();
+      toast('Вы добавлены в смену. Ваши продажи считаются отдельно.');
     },
     addOpenSeller: () => $('#openSellers').insertAdjacentHTML('beforeend', sellerRowHtml({ start: nowTime() })),
     fillPrev: (b) => {
@@ -2023,7 +2132,8 @@
     discNote: (b) => openDiscNote(b.dataset.date, b.dataset.key),
     oilAdd: () => openOilEdit(null, false),
     oilEdit: (b) => openOilEdit(b.dataset.id, false),
-    oilImport: openImport,
+    oilImport: () => openImport(),
+    oilSeed: () => openImport(window.SEED.TEXT.trim()),
     goodAdd: () => openOilEdit(null, true),
     goodEdit: (b) => openOilEdit(b.dataset.id, true),
     sellersRef: openSellersRef,
@@ -2074,6 +2184,7 @@
     },
     logout: () => {
       LS.del('am_pin');
+      SS.del('am_pin');
       S.pin = '';
       location.reload();
     },
@@ -2101,6 +2212,37 @@
     if (e.key === 'Escape' && !$('#modal').hidden) closeModal();
   });
   document.addEventListener('submit', (e) => {
+    if (e.target.id === 'quickOil') {
+      e.preventDefault();
+      const f = e.target;
+      const name = f.name.value.trim();
+      const raw = f.price.value.trim();
+      if (!name) return toast('Укажите название аромата', true);
+      if (!C.blank(raw) && !(C.num(raw) > 0)) return toast('Проверьте цену', true);
+      const ex = C.findOil(S.settings, name);
+      if (ex) return toast(`«${ex.name}» уже есть. Нажмите на его цену, чтобы изменить.`, true);
+      addOils([{ name, price: C.blank(raw) ? null : C.num(raw) }])
+        .then(() => {
+          S.refSearch = '';
+          render();
+          toast(`«${name}» добавлен`);
+          const inp = $('#quickOil [name=name]');
+          if (inp) inp.focus();
+        })
+        .catch(fail);
+      return;
+    }
+    if (e.target.id === 'ownerNameForm') {
+      e.preventDefault();
+      const name = e.target.ownerName.value.trim();
+      saveSettings((st) => {
+        st.ownerName = name;
+      }).then(() => {
+        render();
+        toast('Сохранено');
+      }).catch(fail);
+      return;
+    }
     if (e.target.id === 'openForm' || e.target.id === 'sellerOpenForm') {
       e.preventDefault();
       const btn = $('button.primary', e.target);
@@ -2136,7 +2278,13 @@
     S.pin = $('#pinInput').value.trim();
     try {
       await whoAmI();
-      LS.set('am_pin', S.pin);
+      S.remembered = $('#rememberIn').checked;
+      if (S.remembered) LS.set('am_pin', S.pin);
+      else {
+        LS.del('am_pin');
+        SS.set('am_pin', S.pin);
+      }
+      lastActive = Date.now();
       $('#login').hidden = true;
       $('#pinInput').value = '';
       await loadAll();
@@ -2172,6 +2320,17 @@
     refresh().then(() => $('#modal').hidden && render()).catch(() => {});
   };
   document.addEventListener('visibilitychange', softRefresh);
+
+  // Руководитель на общем телефоне: без «Запомнить» вход сбрасывается через 15 минут без действий
+  let lastActive = Date.now();
+  ['click', 'keydown', 'touchstart'].forEach((ev) => document.addEventListener(ev, () => (lastActive = Date.now()), { passive: true }));
+  setInterval(() => {
+    if (S.role !== 'owner' || S.remembered || !S.pin || !(S.health && S.health.auth)) return;
+    if (Date.now() - lastActive > 15 * 60 * 1000) {
+      SS.del('am_pin');
+      location.reload();
+    }
+  }, 30000);
   setInterval(softRefresh, 60000);
 
   boot();

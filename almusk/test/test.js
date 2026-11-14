@@ -133,6 +133,14 @@ async function calcTests() {
     assert.equal(d.find((x) => x.key === 'cash').diff, -500);
     assert.equal(d.find((x) => x.key === 'terminal').diff, 500);
   });
+  await test('разбор списка: «?» означает цену неизвестна', () => {
+    const r = C.parsePriceList('Chanel splandide ?\nLV pacific chill?\nShaikh 77 150');
+    assert.deepEqual(r.rows, [
+      { name: 'Chanel splandide', price: null },
+      { name: 'LV pacific chill', price: null },
+      { name: 'Shaikh 77', price: 150 },
+    ]);
+  });
   await test('разбор списка цен', () => {
     const r = C.parsePriceList('Baccarat Rouge 540 — 120\nBlack Opium; 85,5\nTom Ford Oud Wood 140 тг\nмусор');
     assert.deepEqual(r.rows, [
@@ -180,6 +188,14 @@ async function apiTests() {
       assert.equal(r.body.value.concentration['50'], 35);
       assert.equal(r.body.value.perfumeBottles['100'], 650);
       assert.equal(r.body.value.oilBottles['4.5'], 100);
+    });
+    await test('первый запуск: стартовый список ароматов загружен', async () => {
+      const oils = (await call('GET', '/api/settings')).body.value.oils;
+      assert.equal(oils.length, 209);
+      assert.equal(oils.find((o) => o.name === 'Creed aventus').price, 125);
+      assert.equal(oils.find((o) => o.name === 'Armani acqua di gio (мужской)').price, 145);
+      assert.equal(oils.find((o) => o.name === 'Chanel splandide').price, null);
+      assert.equal(oils.find((o) => o.name === 'Le labo another 13').price, 320);
     });
     await test('справочник: защита от одновременной записи', async () => {
       const cur = (await call('GET', '/api/settings')).body;
@@ -370,6 +386,47 @@ async function apiTests() {
       const idx = (await call('GET', '/api/index')).body;
       assert.equal(idx[T].openingUnconfirmed, false);
       assert.equal(idx[T].disc.length, 0);
+    });
+
+    /* ---------- Цены и руководитель в смене ---------- */
+    const T2 = (() => {
+      const d = new Date(Date.parse(`${T}T00:00:00Z`) + 86400000);
+      return d.toISOString().slice(0, 10);
+    })();
+    await test('руководитель в смене: продавец видит его в списке, зарплата 0', async () => {
+      const cur = (await call('GET', '/api/settings')).body;
+      await call('PUT', '/api/settings', { rev: cur.rev, value: { ...cur.value, ownerName: 'Амина', oils: cur.value.oils.concat({ name: 'Без цены', price: null }) } });
+      const st = (await call('GET', '/api/settings', null, S)).body.value;
+      assert.ok(st.sellers.some((x) => x.name === 'Амина' && x.owner));
+      const r = await call('POST', `/api/day/${T2}`, { type: 'open', opening: { cash: 21700 }, sellers: [{ name: 'Дана' }, { name: 'Амина' }] }, S);
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const own = (await call('GET', `/api/day/${T2}`)).body.value;
+      assert.equal(own.sellers.find((x) => x.name === 'Амина').salary, 0);
+      assert.equal(own.sellers.find((x) => x.name === 'Дана').salary, 5000);
+    });
+    await test('аромат в справочнике без цены: продажа ждёт себестоимости', async () => {
+      const r = await call('POST', `/api/day/${T2}`, { type: 'upsertSale', sale: { id: 'q1', seller: 'Амина', items: [{ type: 'perfume', name: 'Без цены', volume: 50, price: 12000 }], pay: { kaspi: 12000 } } }, S);
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const it = (await call('GET', `/api/day/${T2}`)).body.value.sales[0].items[0];
+      assert.equal(it.costPending, true);
+      assert.equal(it.conc, 35);
+      assert.equal(it.bottleCost, 350);
+    });
+    await test('исправление ошибочной цены пересчитывает прошлые продажи, изменение цены нет', async () => {
+      // ошибка: Black Opium был 50, правильно 60
+      let r = await call('POST', '/api/reprice', { name: 'black opium', price: 60, from: T, to: T2 });
+      assert.equal(r.body.days, 1);
+      let it = (await call('GET', `/api/day/${T}`)).body.value.sales[0].items[0];
+      assert.equal(it.oilPrice, 60);
+      assert.equal(C.itemCalc(it).cost, 12 * 60 + 45 + 300);
+      const log = (await call('GET', `/api/day/${T}`)).body.value.log.find((l) => l.a === 'reprice');
+      assert.equal(log.d.items, 1);
+      // первая цена для аромата без цены снимает ожидание
+      r = await call('POST', '/api/reprice', { name: 'Без цены', price: 100, from: '2000-01-01', to: '2999-12-31' });
+      it = (await call('GET', `/api/day/${T2}`)).body.value.sales[0].items[0];
+      assert.equal(it.costPending, undefined);
+      assert.equal(C.itemCalc(it).cost, 17.5 * 100 + 32.5 * 2.5 + 350);
+      assert.equal((await call('POST', '/api/reprice', { name: 'x', price: 1, from: T, to: T }, S)).status, 403);
     });
   } finally {
     srv.close();

@@ -32,7 +32,7 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 
 const SELLER_ACTIONS = new Set(['open', 'addSeller', 'upsertSale', 'removeSale', 'upsertOp', 'removeOp', 'setPhoto', 'submit']);
 const SELLER_OP_KINDS = new Set(['business', 'purchase', 'refund']);
-const OWNER_ON_CLOSED = new Set(['reopen', 'setDiscNote', 'fillPending']);
+const OWNER_ON_CLOSED = new Set(['reopen', 'setDiscNote', 'fillPending', 'reprice']);
 const COST_FIELDS = ['oilPrice', 'basePrice', 'bottleCost', 'unitCost'];
 const SELLER_CLOSING = ['kaspiTerminal', 'transfersReported', 'cashSalesReported', 'cashActual'];
 const CLOSING_FIELDS = [...SELLER_CLOSING, 'kaspiActual', 'transferActual', 'commission'];
@@ -62,7 +62,10 @@ function validateSellers(list) {
 
 /** Продавцы из справочника руководителя: зарплату продавец не задаёт сам. */
 function sellersFromDirectory(list, settings) {
-  const dir = (settings && settings.sellers) || [];
+  const dir = ((settings && settings.sellers) || []).slice();
+  // Руководитель тоже может работать в смене: без зарплаты
+  const owner = settings && String(settings.ownerName || '').trim();
+  if (owner && !dir.some((x) => Calc.norm(x.name) === Calc.norm(owner))) dir.push({ name: owner, salary: 0 });
   if (!dir.length) throw new HttpError(400, 'Руководитель ещё не добавил продавцов в справочник');
   return (list || []).map((s) => {
     const d = dir.find((x) => Calc.norm(x.name) === Calc.norm(s.name));
@@ -102,10 +105,11 @@ function priceFromSettings(it, settings) {
     } else {
       bottle = Calc.tableValue(settings.oilBottles, vol);
     }
-    out.oilPrice = oil ? oil.price : '';
+    const priced = Calc.hasPrice(oil);
+    out.oilPrice = priced ? oil.price : '';
     out.bottleCost = bottle === null ? '' : bottle;
     if (oil) out.name = oil.name;
-    out.costPending = !oil || bottle === null;
+    out.costPending = !priced || bottle === null;
   } else {
     const g = Calc.findGood(settings, it.name);
     out.unitCost = g ? g.cost : '';
@@ -381,6 +385,23 @@ function applyAction(day, action, now = new Date(), ctx = {}) {
         });
       }
       if (n) log('fillPending', { filled: n });
+      break;
+    }
+    case 'reprice': {
+      // Исправление ошибочной закупочной цены аромата с согласия руководителя
+      const price = Calc.num(action.price);
+      if (!(price > 0)) throw new HttpError(400, 'Укажите цену');
+      let n = 0;
+      for (const sale of day.sales) {
+        for (const it of sale.items) {
+          if (it.type === 'other' || Calc.norm(it.name) !== Calc.norm(action.name)) continue;
+          if (Calc.num(it.oilPrice) === price && !it.costPending) continue;
+          it.oilPrice = price;
+          if (it.costPending && !Calc.costMissing(it).length) delete it.costPending;
+          n += 1;
+        }
+      }
+      if (n) log('reprice', { name: String(action.name), price, items: n });
       break;
     }
     case 'close': {

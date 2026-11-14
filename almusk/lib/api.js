@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const Calc = require('../public/calc.js');
 const { createStore } = require('./store');
 const { mutateDay, viewFor, HttpError, K, DATE_RE } = require('./db');
+const SEED = require('../public/seed.js');
 
 let cached = null;
 function getStore() {
@@ -95,7 +96,10 @@ function settingsForSeller(s) {
     oilBottles: Object.fromEntries(Object.keys(s.oilBottles || {}).map((k) => [k, null])),
     oils: (s.oils || []).map((o) => ({ id: o.id, name: o.name })),
     goods: (s.goods || []).map((g) => ({ id: g.id, name: g.name })),
-    sellers: (s.sellers || []).map((x) => ({ name: x.name })),
+    sellers: (s.sellers || []).map((x) => ({ name: x.name })).concat(
+      s.ownerName && !(s.sellers || []).some((x) => Calc.norm(x.name) === Calc.norm(s.ownerName)) ? [{ name: s.ownerName, owner: true }] : [],
+    ),
+    ownerName: s.ownerName || '',
     changeLog: [],
   };
 }
@@ -125,7 +129,7 @@ function cleanSettings(v) {
   s.oils = (s.oils || []).filter((o) => o && !Calc.blank(o.name)).map((o) => ({
     id: o.id || crypto.randomBytes(5).toString('hex'),
     name: String(o.name).trim(),
-    price: Calc.num(o.price),
+    price: Calc.blank(o.price) || !(Calc.num(o.price) > 0) ? null : Calc.num(o.price),
     updated: String(o.updated || ''),
     history: Array.isArray(o.history) ? o.history.slice(-50) : [],
   }));
@@ -143,7 +147,15 @@ function cleanSettings(v) {
   }));
   s.sellers = (s.sellers || []).filter((x) => x && !Calc.blank(x.name)).map((x) => ({ name: String(x.name).trim(), salary: Calc.num(x.salary) }));
   s.changeLog = Array.isArray(s.changeLog) ? s.changeLog.slice(-200) : [];
+  s.ownerName = String(s.ownerName || '').trim();
   return s;
+}
+
+function seedOils() {
+  const seen = new Set();
+  return Calc.parsePriceList(SEED.TEXT).rows
+    .filter((r) => !seen.has(Calc.norm(r.name)) && seen.add(Calc.norm(r.name)))
+    .map((r) => ({ name: r.name, price: r.price, updated: SEED.DATE, history: r.price ? [{ date: SEED.DATE, price: r.price }] : [] }));
 }
 
 async function handle(req, res) {
@@ -181,7 +193,13 @@ async function handle(req, res) {
 
     if (p === '/api/settings') {
       if (m === 'GET') {
-        const cur = await store.get(K.settings);
+        let cur = await store.get(K.settings);
+        if (!cur) {
+          // Первый запуск: справочник ароматов из стартового списка
+          const value = cleanSettings({ oils: seedOils() });
+          if (await store.cas(K.settings, 0, value)) cur = { rev: 1, value };
+          else cur = await store.get(K.settings);
+        }
         const value = Calc.withDefaults(cur && cur.value);
         return send(res, 200, { rev: cur ? cur.rev : 0, value: role === 'owner' ? value : settingsForSeller(value) });
       }
@@ -252,6 +270,27 @@ async function handle(req, res) {
         await store.delRaw(K.photo(date));
         return send(res, 200, { rev: day.rev, value: viewFor(day.value, role) });
       }
+    }
+
+    if (p === '/api/reprice' && m === 'POST') {
+      ownerOnly(role);
+      const body = await readBody(req);
+      const from = String(body.from || '');
+      const to = String(body.to || '');
+      if (!DATE_RE.test(from) || !DATE_RE.test(to) || from > to) throw new HttpError(400, 'Неверный период');
+      if (Calc.blank(body.name) || !(Calc.num(body.price) > 0)) throw new HttpError(400, 'Укажите аромат и цену');
+      const idx = await store.hgetall(K.index);
+      const dates = Object.keys(idx).filter((d) => d >= from && d <= to).sort();
+      const docs = await store.mget(dates.map(K.day));
+      const key = Calc.norm(body.name);
+      let days = 0;
+      for (let i = 0; i < dates.length; i++) {
+        const d = docs[i] && docs[i].value;
+        if (!d || !d.sales.some((s) => s.items.some((it) => it.type !== 'other' && Calc.norm(it.name) === key))) continue;
+        await mutateDay(store, dates[i], { type: 'reprice', name: body.name, price: body.price }, { role });
+        days += 1;
+      }
+      return send(res, 200, { ok: true, days });
     }
 
     if (p === '/api/export' && m === 'GET') {
