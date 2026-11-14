@@ -34,14 +34,20 @@ function serveStatic(req, res) {
   });
 }
 
-const server = http.createServer((req, res) => {
+/** Один обработчик на всё: API и файлы интерфейса. */
+function app(req, res) {
   if (req.url.startsWith('/api/')) return handle(req, res);
   return serveStatic(req, res);
-});
+}
+
+const server = http.createServer(app);
 
 if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
   server.listen(port, () => console.log(`Al Musk: http://localhost:${port}`));
 }
 
-module.exports = { server };
+// Экспорт функции-обработчика: так файл работает и на Vercel с пресетом Node
+module.exports = app;
+module.exports.app = app;
+module.exports.server = server;

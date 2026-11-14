@@ -133,7 +133,19 @@ async function calcTests() {
     assert.equal(d.find((x) => x.key === 'cash').diff, -500);
     assert.equal(d.find((x) => x.key === 'terminal').diff, 500);
   });
-  await test('разбор списка: «?» означает цену неизвестна', () => {
+  await test('аренда делится на дни месяца, оплата аренды не вычитается дважды', () => {
+    const st = C.withDefaults({ fixed: [{ category: 'Аренда', amount: 300000 }] });
+    const day = { date: '2026-11-14', opening: {}, sellers: [{ name: 'D', salary: 5000 }], sales: [{ seller: 'D', items: [perfume({ price: 20000 })], pay: { cash: 20000 } }], ops: [{ kind: 'business', category: 'Аренда', amount: 300000, account: 'kaspi' }], closing: {} };
+    const n = C.dayNet(day, st);
+    assert.equal(n.fixedDaily, 10000);
+    assert.equal(n.operating, 20000 - 945 - 5000);
+    assert.equal(n.net, 20000 - 945 - 5000 - 10000);
+    const be = C.breakeven([day], st, '2026-11-01', '2026-11-14', '2026-11-14');
+    assert.equal(be.fixedAccrued, 140000);
+    assert.equal(be.month.daysLeft, 17);
+    assert.ok(be.month.needPerDay > 0);
+  });
+    await test('разбор списка: «?» означает цену неизвестна', () => {
     const r = C.parsePriceList('Chanel splandide ?\nLV pacific chill?\nShaikh 77 150');
     assert.deepEqual(r.rows, [
       { name: 'Chanel splandide', price: null },
@@ -427,6 +439,62 @@ async function apiTests() {
       assert.equal(it.costPending, undefined);
       assert.equal(C.itemCalc(it).cost, 17.5 * 100 + 32.5 * 2.5 + 350);
       assert.equal((await call('POST', '/api/reprice', { name: 'x', price: 1, from: T, to: T }, S)).status, 403);
+    });
+
+    /* ---------- Склад и аренда ---------- */
+    await test('склад: продажи списывают масло, основу и флаконы', async () => {
+      const r = await call('GET', '/api/stock');
+      assert.equal(r.status, 200);
+      const c = r.body.cons[T2];
+      assert.equal(c.oil[C.norm('Без цены')].qty, 17.5);
+      assert.equal(c.base, 32.5);
+      assert.equal(c.bottle['perfume:50'], 1);
+      assert.equal((await call('GET', '/api/stock', null, S)).status, 403);
+    });
+    await test('приход: остаток растёт, оплата пишется в открытую смену', async () => {
+      const r = await call('POST', '/api/stock', { type: 'receipt', date: T2, payFrom: 'cash', note: 'поставщик', lines: [
+        { kind: 'oil', name: 'Без цены', qty: 100, sum: 9000 },
+        { kind: 'bottle', bottleType: 'perfume', volume: 50, qty: 10, sum: 3500 },
+      ] });
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      assert.match(r.body.payNote, /записана/);
+      const day = (await call('GET', `/api/day/${T2}`)).body.value;
+      const op = day.ops.find((o) => o.kind === 'purchase' && o.category === 'Масла');
+      assert.equal(op.amount, 9000);
+      const st = await call('GET', '/api/stock');
+      const settings = (await call('GET', '/api/settings')).body.value;
+      const list = C.stockState(st.body.value, st.body.cons, settings, T2);
+      const oil = list.find((i) => i.name === 'Без цены');
+      assert.equal(oil.qty, 82.5);
+      assert.equal(oil.unitCost, 90);
+      const b50 = list.find((i) => i.key === 'perfume:50');
+      assert.equal(b50.qty, 9);
+      assert.equal(list.find((i) => i.kind === 'base').negative, true);
+    });
+    await test('ревизия: остаток становится равен факту, продажи после неё списываются', async () => {
+      let r = await call('POST', '/api/stock', { type: 'revision', date: T2, items: [{ kind: 'oil', key: C.norm('Без цены'), name: 'Без цены', expected: 82.5, counted: 80, unitCost: 90 }] });
+      assert.equal(r.status, 200);
+      // продажа после ревизии: следующий день
+      const T3 = C.isoAdd(T2, 1);
+      await call('POST', `/api/day/${T3}`, { type: 'open', opening: { cash: 0, kaspi: 0, transfer: 0 }, sellers: [{ name: 'Амина', salary: 0 }] });
+      await call('POST', `/api/day/${T3}`, { type: 'upsertSale', sale: { seller: 'Амина', items: [{ type: 'oil', name: 'Без цены', volume: 6, oilPrice: 100, bottleCost: 120, price: 4000 }], pay: { cash: 4000 } } });
+      const st = await call('GET', '/api/stock');
+      const settings = (await call('GET', '/api/settings')).body.value;
+      const oil = C.stockState(st.body.value, st.body.cons, settings, T3).find((i) => i.name === 'Без цены');
+      assert.equal(oil.revCount, 80);
+      assert.equal(oil.qty, 74);
+      r = await call('POST', '/api/stock', { type: 'revision', date: T2, items: [{ kind: 'oil', key: 'x', counted: '' }] });
+      assert.equal(r.status, 400);
+    });
+    await test('аренда в справочнике: неизвестные статьи отбрасываются, день считается с арендой', async () => {
+      const cur = (await call('GET', '/api/settings')).body;
+      const r = await call('PUT', '/api/settings', { rev: cur.rev, value: { ...cur.value, fixed: [{ category: 'Аренда', amount: 310000 }, { category: 'Чужое', amount: 5 }] } });
+      assert.deepEqual(r.body.value.fixed, [{ category: 'Аренда', amount: 310000 }]);
+      assert.deepEqual((await call('GET', '/api/settings', null, S)).body.value.fixed, []);
+      const day = (await call('GET', `/api/day/${T2}`)).body.value;
+      const n = C.dayNet(day, r.body.value);
+      assert.equal(n.fixedDaily, C.r2(310000 / C.daysInMonth(T2)));
+      assert.equal(n.net, C.r2(n.operating - n.fixedDaily));
     });
   } finally {
     srv.close();

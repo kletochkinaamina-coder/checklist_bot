@@ -18,6 +18,8 @@ const K = {
   photo: (d) => `am:photo:${d}`,
   index: 'am:index',
   sellerPin: 'am:sellerpin',
+  stock: 'am:stock',
+  cons: 'am:cons',
 };
 
 class HttpError extends Error {
@@ -474,6 +476,8 @@ async function mutateDay(store, date, action, ctx = {}) {
     const rev = cur ? cur.rev : 0;
     if (await store.cas(K.day(date), rev, next)) {
       await store.hset(K.index, date, Calc.daySummary(next));
+      // Расход материалов дня для склада: всегда в соответствии с продажами
+      await store.hset(K.cons, date, Calc.dayConsumption(next));
       return { rev: rev + 1, value: next };
     }
   }

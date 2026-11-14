@@ -590,8 +590,9 @@
 
   /* ---------- Тексты отчётов ---------- */
 
-  function dailyReportText(day) {
+  function dailyReportText(day, settings) {
     const t = dayTotals(day);
+    const dn = settings ? dayNet(day, settings, t) : null;
     const L = [];
     const cl = day.closing || {};
     L.push(`AL MUSK — ОТЧЁТ ЗА ${dmy(day.date)}`);
@@ -623,6 +624,10 @@
     L.push(`• Другие расходы бизнеса: ${money(t.business)}`);
     for (const [c, v] of Object.entries(t.ops.business.cats)) L.push(`   ${c}: ${money(v)}`);
     L.push(`• Результат после расходов: ${money(t.result)}`);
+    if (dn && dn.hasFixed) {
+      L.push(`• Постоянные расходы на день (${money(fixedMonthly(settings))} в месяц): −${money(dn.fixedDaily)}${dn.fixedPaid ? `, оплата аренды за день ${money(dn.fixedPaid)} учтена как месячная` : ''}`);
+      L.push(`• Итог дня с учётом аренды: ${money(dn.net)} (${dn.net >= 0 ? 'в плюсе' : 'убыток'})`);
+    }
     L.push('');
     L.push('4. Денежные остатки');
     for (const acc of ACCOUNTS) {
@@ -671,7 +676,7 @@
     return L.join('\n');
   }
 
-  function rangeReportText(R, title) {
+  function rangeReportText(R, title, be) {
     const L = [];
     L.push(`AL MUSK — ${title || 'ОТЧЁТ ЗА ПЕРИОД'} ${dmy(R.from)} – ${dmy(R.to)}`);
     L.push(`Дней со сменами: ${R.days}, закрыто: ${R.closed}`);
@@ -686,6 +691,11 @@
     for (const [c, v] of Object.entries(R.businessCats)) L.push(`   ${c}: ${money(v)}`);
     if (R.refunds) L.push(`• Возвраты покупателям: ${money(R.refunds)}`);
     L.push(`• Чистый операционный результат: ${money(R.result)}`);
+    if (be && be.monthly) {
+      L.push(`• Постоянные расходы за период (${money(be.monthly)} в месяц): −${money(be.fixedAccrued)}`);
+      L.push(`• Итог с учётом аренды: ${money(be.net)} (${be.net >= 0 ? 'в плюсе' : 'убыток'})`);
+      if (be.needPerShift !== null) L.push(`• Безубыточная выручка за смену: ${money(be.needPerShift)}, сейчас в среднем ${money(be.avgRevenue)}`);
+    }
     L.push('');
     L.push('Деньги (не прибыль)');
     L.push(`• Закупки товара: ${money(R.purchases)}`);
@@ -715,6 +725,222 @@
     if (!R.disc.length) L.push('• Нет');
     for (const d of R.disc) L.push(`• ${dmy(d.date)} ${d.label}: ${signed(d.diff)}${d.resolved ? ' (выяснено)' : ' (не выяснено)'}${d.comment ? `, ${d.comment}` : ''}`);
     return L.join('\n');
+  }
+
+  /* ---------- Постоянные расходы и безубыточность ---------- */
+
+  const isoAdd = (iso, n) => {
+    const d = new Date(`${iso}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  };
+  const daysInMonth = (iso) => {
+    const [y, m] = iso.split('-').map(Number);
+    return new Date(Date.UTC(y, m, 0)).getUTCDate();
+  };
+  const fixedMonthly = (settings) => r2(((settings && settings.fixed) || []).reduce((a, f) => a + num(f.amount), 0));
+  const fixedDaily = (settings, date) => r2(fixedMonthly(settings) / daysInMonth(date));
+  const fixedCats = (settings) => new Set(((settings && settings.fixed) || []).map((f) => f.category));
+
+  /**
+   * Итог дня с учётом постоянных расходов (аренда и т.п.).
+   * Месячная сумма делится на дни месяца; фактическая оплата аренды в этот день
+   * второй раз не вычитается.
+   */
+  function dayNet(day, settings, t) {
+    t = t || dayTotals(day);
+    const cats = fixedCats(settings);
+    let fixedPaid = 0;
+    for (const [c, v] of Object.entries(t.ops.business.cats)) if (cats.has(c)) fixedPaid += v;
+    const fd = fixedDaily(settings, day.date);
+    const operating = r2(t.result + fixedPaid);
+    return { fixedDaily: fd, fixedPaid: r2(fixedPaid), operating, net: r2(operating - fd), hasFixed: fixedMonthly(settings) > 0 };
+  }
+
+  /**
+   * Безубыточность за период и темп на месяц.
+   * operating: результат после себестоимости, зарплат, комиссий и прочих расходов, но до постоянных.
+   */
+  function breakeven(days, settings, from, to, today) {
+    const R = rangeTotals(days);
+    let operating = 0;
+    let fixedPaid = 0;
+    for (const d of days) {
+      const n = dayNet(d, settings);
+      operating += n.operating;
+      fixedPaid += n.fixedPaid;
+    }
+    let fixedAccrued = 0;
+    let calDays = 0;
+    for (let d = from; d <= to; d = isoAdd(d, 1)) {
+      fixedAccrued += fixedDaily(settings, d);
+      calDays += 1;
+      if (calDays > 400) break;
+    }
+    const shiftDays = days.length;
+    const m = R.revenue > 0 ? (R.gross - R.commission - R.refunds) / R.revenue : null;
+    const otherPerShift = shiftDays ? (R.salaries + (R.business - fixedPaid)) / shiftDays : 0;
+    const fixedPerCalDay = calDays ? fixedAccrued / calDays : 0;
+    const share = calDays ? Math.max(shiftDays / calDays, 0.01) : 1;
+    // выручка смены, при которой магазин в ноль: постоянные расходы ложатся на рабочие дни
+    const needPerShift = m && m > 0 ? (fixedPerCalDay / share + otherPerShift) / m : null;
+    const out = {
+      monthly: fixedMonthly(settings),
+      operating: r2(operating),
+      fixedAccrued: r2(fixedAccrued),
+      net: r2(operating - fixedAccrued),
+      margin: m,
+      shiftDays,
+      calDays,
+      avgRevenue: shiftDays ? r2(R.revenue / shiftDays) : 0,
+      avgCheck: R.avgCheck,
+      needPerShift: needPerShift === null ? null : r2(needPerShift),
+      otherPerShift: r2(otherPerShift),
+    };
+    // Месяц: сколько постоянных расходов уже покрыто и что нужно на оставшиеся дни
+    if (today) {
+      const monthStart = `${today.slice(0, 7)}-01`;
+      const mDays = days.filter((d) => d.date >= monthStart && d.date <= today);
+      let mOperating = 0;
+      for (const d of mDays) mOperating += dayNet(d, settings).operating;
+      const dim = daysInMonth(today);
+      const dayNo = Number(today.slice(8, 10));
+      const todayDone = mDays.some((d) => d.date === today && d.status === 'closed');
+      const daysLeft = dim - dayNo + (todayDone ? 0 : 1);
+      const remaining = Math.max(0, out.monthly - mOperating);
+      out.month = {
+        covered: r2(Math.max(0, mOperating)),
+        operating: r2(mOperating),
+        remaining: r2(remaining),
+        pct: out.monthly ? Math.min(100, Math.max(0, (mOperating / out.monthly) * 100)) : null,
+        daysLeft,
+        needPerDay: m && m > 0 && daysLeft > 0 ? r2((remaining / daysLeft + otherPerShift) / m) : null,
+      };
+    }
+    return out;
+  }
+
+  /* ---------- Склад ---------- */
+
+  const BASE_NAME = 'Парфюмерная основа';
+  const bottleName = (key) => {
+    const [t, v] = String(key).split(':');
+    return `Флакон для ${t === 'oil' ? 'масла' : 'духов'} ${fmt(num(v))} мл`;
+  };
+
+  /** Расход материалов за день по продажам (подарки тоже расходуют товар). */
+  function dayConsumption(day) {
+    const out = { oil: {}, base: 0, bottle: {}, good: {} };
+    for (const sale of day.sales || []) {
+      for (const it of sale.items || []) {
+        const c = itemCalc(it);
+        if (it.type === 'perfume' || it.type === 'oil') {
+          const k = norm(it.name);
+          const o = (out.oil[k] = out.oil[k] || { name: it.name, qty: 0 });
+          o.qty = r2(o.qty + c.oilMl);
+          if (it.type === 'perfume') out.base = r2(out.base + c.baseMl);
+          const bk = `${it.type}:${num(it.volume)}`;
+          out.bottle[bk] = (out.bottle[bk] || 0) + 1;
+        } else {
+          const k = norm(it.name);
+          const g = (out.good[k] = out.good[k] || { name: it.name, qty: 0 });
+          g.qty += c.qty;
+        }
+      }
+    }
+    return out;
+  }
+
+  const DEFAULT_ALERTS = { oilMl: 30, baseMl: 500, bottles: 10, goods: 3 };
+
+  /**
+   * Остатки склада. По каждой позиции: последняя ревизия (на конец её дня) +
+   * приходы после неё − расход по продажам после неё.
+   * asOf: считать на конец этой даты (для ревизии задним числом).
+   */
+  function stockState(stock, cons, settings, today, asOf) {
+    stock = stock || {};
+    const until = asOf || '9999-12-31';
+    const items = {};
+    const get = (kind, key, name) => {
+      const id = `${kind}|${key}`;
+      if (!items[id]) {
+        items[id] = { id, kind, key, name, unit: kind === 'oil' || kind === 'base' ? 'мл' : 'шт', revDate: null, revCount: null, received: 0, consumed: 0, cons30: 0, lastDate: null, lastUnitCost: null, lastSale: null };
+      }
+      return items[id];
+    };
+    for (const o of settings.oils || []) get('oil', norm(o.name), o.name);
+    get('base', 'base', BASE_NAME);
+    for (const v of Object.keys(settings.perfumeBottles || {})) get('bottle', `perfume:${num(v)}`, bottleName(`perfume:${num(v)}`));
+    for (const v of Object.keys(settings.oilBottles || {})) get('bottle', `oil:${num(v)}`, bottleName(`oil:${num(v)}`));
+    for (const g of settings.goods || []) get('good', norm(g.name), g.name);
+
+    const revs = (stock.revisions || []).filter((r) => r.date <= until)
+      .sort((a, b) => (a.date === b.date ? ((a.at || '') < (b.at || '') ? -1 : 1) : a.date < b.date ? -1 : 1));
+    for (const rv of revs) {
+      for (const r of rv.items || []) {
+        const it = get(r.kind, r.key, r.name);
+        it.revDate = rv.date;
+        it.revCount = num(r.counted);
+      }
+    }
+    for (const rc of stock.receipts || []) {
+      if (rc.date > until) continue;
+      const it = get(rc.kind, rc.key, rc.name);
+      if (!it.revDate || rc.date > it.revDate) it.received = r2(it.received + num(rc.qty));
+      if (num(rc.qty) > 0 && num(rc.sum) > 0 && (!it.lastDate || rc.date >= it.lastDate)) {
+        it.lastDate = rc.date;
+        it.lastUnitCost = num(rc.sum) / num(rc.qty);
+      }
+    }
+    const from30 = isoAdd(today, -29);
+    for (const [date, c] of Object.entries(cons || {})) {
+      if (date > until) continue;
+      const add = (kind, key, name, q) => {
+        const it = get(kind, key, name);
+        if (!it.revDate || date > it.revDate) it.consumed = r2(it.consumed + q);
+        if (date >= from30 && date <= today) it.cons30 = r2(it.cons30 + q);
+        if (q > 0 && (!it.lastSale || date > it.lastSale)) it.lastSale = date;
+      };
+      for (const [k, o] of Object.entries(c.oil || {})) add('oil', k, o.name, num(o.qty));
+      if (c.base) add('base', 'base', BASE_NAME, num(c.base));
+      for (const [k, n] of Object.entries(c.bottle || {})) add('bottle', k, bottleName(k), num(n));
+      for (const [k, g] of Object.entries(c.good || {})) add('good', k, g.name, num(g.qty));
+    }
+    const al = Object.assign({}, DEFAULT_ALERTS, settings.stockAlerts || {});
+    const refCost = (it) => {
+      if (it.kind === 'oil') {
+        const o = findOil(settings, it.name);
+        return hasPrice(o) ? num(o.price) : null;
+      }
+      if (it.kind === 'base') return num(settings.basePrice) || null;
+      if (it.kind === 'bottle') {
+        const [t, v] = it.key.split(':');
+        const x = tableValue(t === 'oil' ? settings.oilBottles : settings.perfumeBottles, v);
+        return x === null ? null : num(x);
+      }
+      const g = findGood(settings, it.name);
+      return g ? num(g.cost) : null;
+    };
+    return Object.values(items).map((it) => {
+      const qty = r2((it.revCount === null ? 0 : it.revCount) + it.received - it.consumed);
+      const unitCost = it.lastUnitCost !== null ? r2(it.lastUnitCost) : refCost(it);
+      const perDay = it.cons30 / 30;
+      const limit = it.kind === 'oil' ? al.oilMl : it.kind === 'base' ? al.baseMl : it.kind === 'bottle' ? al.bottles : al.goods;
+      const tracked = it.revCount !== null || it.received > 0 || it.consumed > 0;
+      return {
+        ...it,
+        qty,
+        unitCost,
+        value: unitCost === null ? null : r2(Math.max(qty, 0) * unitCost),
+        perDay: r2(perDay),
+        daysLeft: perDay > 0 ? Math.max(0, Math.floor(qty / perDay)) : null,
+        tracked,
+        negative: qty < 0,
+        low: tracked && qty <= num(limit),
+        limit: num(limit),
+      };
+    });
   }
 
   /** Разбор списка ароматов из текста: «Название — 45», «Название;45», «Название 45 тг». */
@@ -775,5 +1001,16 @@
     dailyReportText,
     rangeReportText,
     parsePriceList,
+    isoAdd,
+    daysInMonth,
+    fixedMonthly,
+    fixedDaily,
+    dayNet,
+    breakeven,
+    dayConsumption,
+    stockState,
+    bottleName,
+    BASE_NAME,
+    DEFAULT_ALERTS,
   };
 });
