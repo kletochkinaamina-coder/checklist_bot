@@ -1,0 +1,17 @@
+{
+  "name": "al-musk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Al Musk: учёт смен, продаж, себестоимости и кассы парфюмерного магазина",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.3"
+  }
+}

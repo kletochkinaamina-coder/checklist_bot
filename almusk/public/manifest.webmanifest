@@ -1,0 +1,9 @@
+{
+  "name": "Al Musk Учёт",
+  "short_name": "Al Musk",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f1ea",
+  "theme_color": "#16362d",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
