@@ -60,6 +60,7 @@
     index: {},
     tab: LS.get('am_tab') || 'cabinet',
     rep: { mode: 'day', date: null, from: null, to: null, preset: 'month' },
+    dash: { preset: '30', from: null, to: null },
     refSearch: '',
   };
 
@@ -250,6 +251,9 @@
     if (S.tab === 'cabinet') {
       v.innerHTML = viewCabinet();
       loadCabinet();
+    } else if (S.tab === 'dash') {
+      v.innerHTML = viewDash();
+      loadDash();
     } else if (S.tab === 'shift') v.innerHTML = S.day ? viewDay() : viewOpen();
     else if (S.tab === 'reports') {
       v.innerHTML = viewReports();
@@ -1830,7 +1834,7 @@
         </section>
         <section class="card"><h3>Продавцы за месяц</h3>${sellersTable(R.sellerRank, true)}</section>
         <section class="card"><h3>Топ ароматов</h3>${R.topAromas.length ? `<table><tbody>${R.topAromas.slice(0, 5).map((a, i) => `<tr><td>${i + 1}. ${esc(a.name)}</td><td class="n">${a.sold} шт.</td><td class="n">${M(a.revenue)}</td></tr>`).join('')}</tbody></table>` : '<p class="empty">Нет продаж.</p>'}
-          <div style="margin-top:12px"><button class="btn sm" data-act="cabReport">Подробный отчёт за месяц</button></div></section>`;
+          <div class="row wrap" style="margin-top:12px"><button class="btn sm primary" data-act="openDash">Открыть дашборд</button><button class="btn sm" data-act="cabReport">Подробный отчёт за месяц</button></div></section>`;
     } catch (err) {
       const out = $('#cabOut');
       if (out) out.innerHTML = `<section class="card"><div class="note bad">${esc(err.message)}</div></section>`;
@@ -1847,6 +1851,65 @@
     if (dates.includes(S.date)) await loadDay();
     render();
     toast(left ? `Осталось без себестоимости: ${left}. Добавьте эти ароматы в справочник.` : 'Себестоимость заполнена', !!left);
+  }
+
+  /* ---------- Дашборд ---------- */
+
+  const DASH_PRESETS = [['7', '7 дней'], ['30', '30 дней'], ['month', 'Этот месяц'], ['prevMonth', 'Прошлый месяц'], ['90', '90 дней']];
+
+  function dashRange() {
+    const D = S.dash;
+    if (D.preset === 'custom' && D.from && D.to) return [D.from, D.to];
+    if (D.preset === '90') return [addDays(today(), -89), today()];
+    return presetRange(D.preset);
+  }
+
+  function viewDash() {
+    const [from, to] = dashRange();
+    return `<div class="row between wrap" style="margin-bottom:6px"><h2 style="margin:0">Дашборд</h2><span class="small muted">${C.dmy(from)} – ${C.dmy(to)}</span></div>
+      <div class="dash-presets">${DASH_PRESETS.map(([k, l]) => `<button class="btn sm ${S.dash.preset === k ? 'primary' : ''}" data-act="dashPreset" data-p="${k}">${l}</button>`).join('')}
+        <button class="btn sm ${S.dash.preset === 'custom' ? 'primary' : ''}" data-act="dashCustom">Свой период</button></div>
+      <div id="dashOut"><div class="loading">Строю графики…</div></div>`;
+  }
+
+  async function loadDash() {
+    const [from, to] = dashRange();
+    const len = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000) + 1;
+    const pFrom = addDays(from, -len);
+    const pTo = addDays(from, -1);
+    try {
+      const all = await api('GET', `/api/range?from=${pFrom}&to=${to}`);
+      const out = $('#dashOut');
+      if (!out || S.tab !== 'dash') return;
+      const days = all.filter((d) => d.date >= from);
+      const prev = all.filter((d) => d.date >= pFrom && d.date <= pTo);
+      if (!days.length) {
+        out.innerHTML = '<section class="card"><p class="empty">За этот период смен нет. Выберите другой период.</p></section>';
+        return;
+      }
+      window.Dash.mount(out, { days, prev: prev.length ? prev : null, from, to });
+    } catch (err) {
+      const out = $('#dashOut');
+      if (out) out.innerHTML = `<section class="card"><div class="note bad">${esc(err.message)}</div></section>`;
+    }
+  }
+
+  function openDashCustom() {
+    const [from, to] = dashRange();
+    const body = modal('Свой период', `<form><div class="grid2"><label>С<input type="date" name="from" value="${from}"></label><label>По<input type="date" name="to" value="${to}"></label></div>
+      <p class="hint">До 180 дней. Сравнение будет с таким же периодом до него.</p>
+      <div class="sheet-f"><button type="button" class="btn" data-act="closeModal">Отмена</button><button class="btn primary">Показать</button></div></form>`);
+    body.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const f = fd.get('from');
+      const t = fd.get('to');
+      if (!f || !t || f > t) return toast('Проверьте даты', true);
+      if (Date.parse(t) - Date.parse(f) > 180 * 86400000) return toast('Не больше 180 дней', true);
+      Object.assign(S.dash, { preset: 'custom', from: f, to: t });
+      closeModal();
+      render();
+    });
   }
 
   /* ---------- Экран продавца ---------- */
@@ -2154,6 +2217,17 @@
       await act({ type: 'unsubmit', reason });
       render();
       toast('Смена возвращена продавцу');
+    },
+    dashPreset: (b) => {
+      S.dash.preset = b.dataset.p;
+      render();
+    },
+    dashCustom: openDashCustom,
+    openDash: () => {
+      S.tab = 'dash';
+      LS.set('am_tab', 'dash');
+      render();
+      window.scrollTo({ top: 0 });
     },
     tabDisc: () => {
       S.tab = 'disc';
